@@ -1,18 +1,21 @@
 {
-  "source_filename": "Qwen3.8 flash next-部署文档包-20260930.zip",
-  "source_sha256": "d3856053cf73d9c8cd58554c32a5aa6c414c1adf6ea955c2758c7ce24f4b9520",
-  "sanitized_bundle": "downloads/qwen38-deployment-package-20260930-sanitized.zip",
-  "sanitized_sha256": "2e508dea9ceb9e6fb62857ca24fb8cc9e83b888fef22658f49229948c6de23f0",
-  "credentials_replaced": 1,
-  "changed_archive_entries": [
-    "source/config/run-sglang-qwen38-fp8.sh",
-    "source/config/run-sglang-qwen38-v23.sh",
-    "source/config/strata-iq3_s.json",
-    "source/参考原始包/3080双卡-sglang部署建议.zip/3080 双卡 qwen3.827b sglang部署建议/测速脚本/bm27.py",
-    "source/参考原始包/3080双卡-sglang部署建议.zip/3080 双卡 qwen3.827b sglang部署建议/测速脚本/bm8780.py",
-    "source/参考原始包/3080双卡-sglang部署建议.zip/3080 双卡 qwen3.827b sglang部署建议/测速脚本/coldp.py",
-    "source/参考原始包/3080双卡-sglang部署建议.zip/3080 双卡 qwen3.827b sglang部署建议/测速脚本/coldreal.py",
-    "source/参考原始包/3080双卡-sglang部署建议.zip/3080 双卡 qwen3.827b sglang部署建议/测速脚本/vcheck.py"
-  ],
-  "policy": "Archive preserved except credential removal, UTF-8 normalization and ZIP path normalization; no scripts executed."
+  "scope": "Qwen3.8-Flash-Next + Strata deployment documentation only",
+  "source_document_package": "Qwen3.8 flash next-部署文档包-20260930.zip",
+  "source_document_package_sha256": "d3856053cf73d9c8cd58554c32a5aa6c414c1adf6ea955c2758c7ce24f4b9520",
+  "upstream_repository": "https://github.com/Niko1221/Strata",
+  "upstream_source_commit": "d6708a4aae15b4860000d54c8af9e84d684bce09",
+  "upstream_release_checked": "v0.1.29",
+  "review_date": "2026-10-01",
+  "validation": "Static source review, Python syntax, JSON and local documentation links only; no deployment or model execution.",
+  "files_sha256": {
+    "README.md": "c88fcc300bbcf18102e7842b959895bad0549e5dd5f5d1a1edf3519fd71c3a55",
+    "docs/01-hardware.md": "8e9c536dd27cfd3177ba57c14720bf7a2c7601d7569a4e3d4f4f6eff655e7348",
+    "docs/02-download-and-environment.md": "6a48fa6faa119793d806df9e54cc8244e81bf6622b98f269eefa72dd4ddfe15e",
+    "docs/03-windows-deployment.md": "78dbe8800086d5cf37f4a51a55f07316c1c7815d1c6c23601f9f2ebc50201ca8",
+    "docs/04-linux-and-multi-gpu.md": "f8748f9bc69cd640c22efd972dd7679857e24057d6773840a61625a3d4a9d1f0",
+    "docs/05-parameters-validation.md": "541fe8438efda9e492712089eb890f60f0c519119bf512b73186da0b0b57da1d",
+    "docs/SOURCES.md": "f32a3636d21293b3eb267caedba45bddb102e32c54adaed01fd023296f54bb4b",
+    "config/strata-iq3_s.example.json": "0055d50527528ed4ef082438d2e10e2734e099c53eae99221785d6f32b2ddf8e",
+    "scripts/verify.py": "47912f9881b870d5b82d6f9fdd1b2006ea961eb4f87a2392cde751a68eb243c0"
+  }
 }

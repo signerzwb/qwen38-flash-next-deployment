@@ -1,124 +1,125 @@
 #!/usr/bin/env python3
-'''新机器部署完的自检脚本：模型信息 / key 校验 / 普通对话 / 长文找数字 / TTFT 与出字速度。
+"""Verify an existing Strata Flash-Next endpoint; never install or start a model."""
+import argparse
+import json
+import os
+import random
+import sys
+import time
+import urllib.error
+import urllib.request
 
-用法：
-  python verify.py --endpoint http://127.0.0.1:8080 --key <APIKEY> --model qwen3.8-flash-next-iq3_s
-  python verify.py --endpoint http://127.0.0.1:8778 --key <APIKEY> --model Qwen3.8-27B --long-tokens 98000
-'''
-import argparse, json, time, urllib.request, urllib.error, random, string, sys
 
-def _req(url, data=None, key=None, timeout=3600):
-    headers = {'Content-Type': 'application/json'}
+def request(endpoint, key, body=None, timeout=30):
+    headers = {"Content-Type": "application/json"}
     if key:
-        headers['Authorization'] = 'Bearer ' + key
-    body = json.dumps(data, ensure_ascii=False).encode('utf-8') if data is not None else None
-    return urllib.request.Request(url, data=body, headers=headers, method='POST' if data is not None else 'GET')
+        headers["Authorization"] = "Bearer " + key
+    payload = None if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(endpoint, data=payload, headers=headers)
+    return urllib.request.urlopen(req, timeout=timeout)
 
-def check_models(ep, key):
-    url = ep.rstrip('/') + '/v1/models'
-    d = json.loads(urllib.request.urlopen(_req(url, key=key), timeout=30).read())
-    m = d['data'][0]
-    ident = m.get('id')
-    ctx = (m.get('meta') or {}).get('n_ctx') or m.get('max_model_len')
-    print('[1] /v1/models OK  model=%s  context=%s' % (ident, ctx))
-    return ident, ctx
 
-def check_no_key(ep):
-    url = ep.rstrip('/') + '/v1/models'
-    try:
-        urllib.request.urlopen(_req(url), timeout=20)
-        print('[2] WARNING: 不带 key 也能访问，key 校验没生效')
-        return False
-    except urllib.error.HTTPError as e:
-        print('[2] 不带 key 被拒，HTTP %s（期望 401）' % e.code)
-        return e.code == 401
-    except Exception as e:
-        print('[2] 不带 key 的请求异常：%s' % e)
-        return False
-
-def chat(ep, key, body, stream=False):
-    url = ep.rstrip('/') + '/v1/chat/completions'
-    b = dict(body)
-    if stream:
-        b['stream'] = True
-        b['stream_options'] = {'include_usage': True}
-    r = urllib.request.urlopen(_req(url, b, key), timeout=3600)
-    if not stream:
-        d = json.loads(r.read())
-        ch = d['choices'][0]
-        return {'text': ch['message'].get('content') or '', 'reasoning': ch['message'].get('reasoning_content'),
-                'finish': ch.get('finish_reason'), 'usage': d.get('usage'), 'ttft': None}
+def stream_chat(endpoint, key, body):
+    payload = dict(body, stream=True, stream_options={"include_usage": True})
+    start = time.perf_counter()
     ttft = None
+    text = []
     usage = {}
-    parts = []
-    t0 = time.time()
-    for raw in r:
-        s = raw.decode('utf-8', 'ignore').strip()
-        if not s.startswith('data:'):
-            continue
-        p = s[5:].strip()
-        if p == '[DONE]':
-            break
-        try:
-            d = json.loads(p)
-        except Exception:
-            continue
-        delta = (d.get('choices') or [{}])[0].get('delta') or {}
-        if delta.get('content'):
-            if ttft is None:
-                ttft = time.time() - t0
-            parts.append(delta['content'])
-        if d.get('usage'):
-            usage = d['usage']
-    return {'text': ''.join(parts), 'finish': None, 'usage': usage,
-            'ttft': ttft, 'total': time.time() - t0}
+    done = False
+    finish = None
+    with request(endpoint + "/v1/chat/completions", key, payload, timeout=3600) as response:
+        for raw in response:
+            line = raw.decode("utf-8").strip()
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data == "[DONE]":
+                done = True
+                break
+            event = json.loads(data)
+            if event.get("error"):
+                raise ValueError("The endpoint returned a streaming error")
+            choices = event.get("choices") or []
+            if choices:
+                content = (choices[0].get("delta") or {}).get("content")
+                if content:
+                    if ttft is None:
+                        ttft = time.perf_counter() - start
+                    text.append(content)
+                if choices[0].get("finish_reason"):
+                    finish = choices[0]["finish_reason"]
+            if event.get("usage"):
+                usage = event["usage"]
+    if not done:
+        raise ValueError("The stream ended without [DONE]")
+    return {"text": "".join(text), "ttft_s": ttft, "total_s": time.perf_counter() - start,
+            "finish_reason": finish, "usage": usage}
 
-def build_long_doc(tokens, fact_id, fact_value):
-    words = ['audit', 'register', 'vendor', 'migration', 'staffing', 'quarterly', 'throughput',
-             'budgets', 'contracts', 'minutes', 'review', 'archived', 'lead', 'risk']
-    lines = []
-    n = max(1, tokens // 25)
-    for i in range(n):
-        lines.append('[%05d] %s' % (i, ' '.join(random.choice(words) for _ in range(20))))
-    lines[n // 2] = '[%05d] %s 的最终结算金额是 %s 元。' % (n // 2, fact_id, fact_value)
-    return '\n'.join(lines)
+
+def long_document(word_count):
+    rng = random.Random(20261001)
+    vocabulary = ["audit", "register", "vendor", "migration", "staffing", "quarterly", "budget", "minutes", "review", "archived"]
+    count = max(3, (word_count + 19) // 20)
+    lines = ["[%05d] %s" % (i, " ".join(rng.choice(vocabulary) for _ in range(20))) for i in range(count)]
+    lines[count // 2] = "KR-4471 的最终结算金额是 837462.19 元。"
+    return "\n".join(lines) + "\n问题：KR-4471 的最终结算金额是多少元？只回答数字。"
+
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument('--endpoint', required=True)
-    ap.add_argument('--key', required=True)
-    ap.add_argument('--model', required=True)
-    ap.add_argument('--long-tokens', type=int, default=98000)
-    ap.add_argument('--think', action='store_true', help='测试时保留思考（默认关闭）')
-    a = ap.parse_args()
-    nothink = {} if a.think else {'chat_template_kwargs': {'enable_thinking': False}}
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--endpoint", required=True, help="Base address without /v1, e.g. http://127.0.0.1:8080")
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--expected-context", type=int)
+    parser.add_argument("--key", default=os.environ.get("STRATA_API_KEY"), help="Prefer STRATA_API_KEY environment variable")
+    parser.add_argument("--long-words", type=int, default=0, help="Optional synthetic long document size in words, not tokens")
+    args = parser.parse_args()
+    if not args.key or args.key == "REPLACE_WITH_YOUR_API_KEY":
+        parser.error("Set your own STRATA_API_KEY or --key; placeholders are not accepted")
+    if args.long_words < 0:
+        parser.error("--long-words must be nonnegative")
+    endpoint = args.endpoint.rstrip("/")
+    failures = []
 
-    check_models(a.endpoint, a.key)
-    check_no_key(a.endpoint)
+    def check(label, passed):
+        print("%s %s" % ("PASS" if passed else "FAIL", label), flush=True)
+        if not passed:
+            failures.append(label)
 
-    body = {'model': a.model, 'messages': [{'role': 'user', 'content': '用一句话介绍你自己'}],
-            'max_tokens': 200, 'temperature': 0.3}
-    body.update(nothink)
-    t0 = time.time()
-    r = chat(a.endpoint, a.key, body)
-    ct = (r['usage'] or {}).get('completion_tokens')
-    print('[3] 普通对话 OK  %.2fs  out_tokens=%s  finish=%s' % (time.time() - t0, ct, r['finish']))
-    print('    reply: %s' % (r['text'][:80].replace('\n', ' ')))
+    with request(endpoint + "/v1/models", args.key) as response:
+        models = json.load(response).get("data") or []
+    model = next((entry for entry in models if entry.get("id") == args.model), None)
+    check("model ID", model is not None)
+    context = ((model or {}).get("meta") or {}).get("n_ctx") or (model or {}).get("max_model_len")
+    print("context=%s" % context)
+    if args.expected_context is not None:
+        check("context length", context is not None and int(context) == args.expected_context)
+    try:
+        with request(endpoint + "/v1/models", None):
+            check("unauthenticated request rejected", False)
+    except urllib.error.HTTPError as error:
+        check("unauthenticated request rejected", error.code == 401)
+    if failures:
+        return 1
 
-    fact = '837462.19'
-    doc = build_long_doc(a.long_tokens, 'KR-4471', fact)
-    q = doc + '\n\n以上是全部文档。问题：文档中编号 KR-4471 的最终结算金额是多少元？只回答数字。'
-    lb = {'model': a.model, 'messages': [{'role': 'user', 'content': q}], 'max_tokens': 24, 'temperature': 0.0}
-    lb.update(nothink)
-    print('[4] 长文测试（首次，冷缓存）...')
-    r1 = chat(a.endpoint, a.key, lb, stream=True)
-    pt = (r1['usage'] or {}).get('prompt_tokens')
-    ct = (r1['usage'] or {}).get('completion_tokens') or 0
-    gen = (r1['total'] - r1['ttft']) if r1['ttft'] else r1['total']
-    print('    prompt_tokens=%s  TTFT=%.2fs  total=%.2fs  decode=%.1f tok/s' % (pt, r1['ttft'] or -1, r1['total'], ct / gen if gen > 0 else 0))
-    print('    answer=%r  期望包含 %s  -> %s' % (r1['text'].strip()[:40], fact, 'PASS' if fact in r1['text'] else 'FAIL'))
-    r2 = chat(a.endpoint, a.key, lb, stream=True)
-    print('[5] 长文重复（应命中缓存）TTFT=%.2fs  total=%.2fs' % (r2['ttft'] or -1, r2['total']))
+    body = {"model": args.model, "messages": [{"role": "user", "content": "用一句话介绍你自己"}],
+            "max_tokens": 200, "temperature": 0.0, "chat_template_kwargs": {"enable_thinking": False}}
+    short = stream_chat(endpoint, args.key, body)
+    check("short conversation", bool(short["text"].strip()) and short["finish_reason"] == "stop")
+    print(json.dumps({k: v for k, v in short.items() if k != "text"}, ensure_ascii=False))
+    if args.long_words:
+        body["messages"] = [{"role": "user", "content": long_document(args.long_words)}]
+        body["max_tokens"] = 24
+        for label in ("first long request (cache state unverified)", "repeated long request"):
+            result = stream_chat(endpoint, args.key, body)
+            check(label, "837462.19" in result["text"] and result["finish_reason"] == "stop")
+            print(json.dumps({k: v for k, v in result.items() if k != "text"}, ensure_ascii=False))
+    return 1 if failures else 0
 
-if __name__ == '__main__':
-    main()
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as error:
+        # Do not dump requests, headers, or exception strings that could contain credentials.
+        print("FAIL request/response error (%s)" % type(error).__name__, file=sys.stderr)
+        sys.exit(1)
