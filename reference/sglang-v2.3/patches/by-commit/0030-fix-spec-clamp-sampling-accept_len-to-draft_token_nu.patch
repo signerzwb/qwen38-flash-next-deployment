@@ -1,0 +1,52 @@
+From ce20ca0f7cefe00651ee7d22b4edf37c52c5b886 Mon Sep 17 00:00:00 2001
+From: root <root@MyComputer.localdomain>
+Date: Mon, 31 Aug 2026 23:35:52 +0800
+Subject: [PATCH 30/38] fix(spec): clamp sampling accept_len to
+ draft_token_num-1 to fix ReplaySSM fold OOB
+
+sampling all-match can return accept_token_num == draft_token_num, which
+flows into:
+(a) accept_index[:, correct_len] as a column index that is OOB
+    (accept_index has only draft_token_num columns), and
+(b) commit_lens = accept_len + 1 > record_len, so the ReplaySSM fold loop
+    reads the ring past MAX_CACHE_LEN.
+
+Clamp correct_len to draft_token_num-1 (same bound the greedy path uses via
+num_correct = min(..., block_size-1)). Rejected tail candidate is re-verified
+on the next round, identical to greedy. No effect on normal loads (accept
+1.6-2.8 << 8, clamp never fires).
+
+Verified: py_compile OK; three downstream indices all in-bounds; temp=1.0
+creative request finish=stop; accept 1.975 within known creative-band.
+---
+ python/sglang/srt/speculative/dflash_utils.py | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/python/sglang/srt/speculative/dflash_utils.py b/python/sglang/srt/speculative/dflash_utils.py
+index 4489b3f009..3849fcb2e3 100644
+--- a/python/sglang/srt/speculative/dflash_utils.py
++++ b/python/sglang/srt/speculative/dflash_utils.py
+@@ -1008,10 +1008,19 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
+         del coins, coins_for_final_sampling
+ 
+     correct_len = accept_token_num
++    # Clamp to draft_token_num - 1 (same bound the greedy path uses via
++    # `num_correct = min(..., block_size - 1)`). Without this a sampling
++    # all-match can return accept_token_num == draft_token_num, which flows
++    # into (a) accept_index[:, correct_len] as a column index that is OOB
++    # (accept_index has only draft_token_num columns), and (b) commit_lens =
++    # accept_len + 1 > record_len, so the ReplaySSM fold loop reads the ring
++    # past MAX_CACHE_LEN. Clamping keeps both in bounds; the rejected tail
++    # candidate is re-verified on the next round, identical to greedy.
++    correct_len = torch.clamp(correct_len.to(torch.long), max=draft_token_num - 1)
+     row_ids = torch.arange(bs, dtype=torch.long, device=device)
+     accept_pos = accept_index[row_ids, correct_len.to(torch.long)].to(torch.long)
+     bonus = predicts[accept_pos].to(torch.int64)
+-    return correct_len, bonus
++    return correct_len.to(torch.int32), bonus
+ 
+ 
+ def build_dflash_verify_target_probs(
+-- 
+2.34.1
+

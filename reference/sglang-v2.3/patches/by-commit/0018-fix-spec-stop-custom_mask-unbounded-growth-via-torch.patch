@@ -1,0 +1,155 @@
+From 5ae118af2060b5705fa7ce70893e492e645036dd Mon Sep 17 00:00:00 2001
+From: Arvind Dhavala <arvinddhavala@Arvinds-MacBook-Air.local>
+Date: Sun, 30 Aug 2026 13:26:45 +0530
+Subject: [PATCH 18/38] fix(spec): stop custom_mask unbounded growth via
+ torch.cat
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+🪷 Generated with Sarvam Code
+---
+ python/sglang/srt/speculative/dflash_info.py  | 16 +---
+ python/sglang/srt/speculative/eagle_info.py   | 16 +---
+ .../unit/spec/test_custom_mask_no_leak.py     | 74 +++++++++++++++++++
+ 3 files changed, 80 insertions(+), 26 deletions(-)
+ create mode 100644 test/registered/unit/spec/test_custom_mask_no_leak.py
+
+diff --git a/python/sglang/srt/speculative/dflash_info.py b/python/sglang/srt/speculative/dflash_info.py
+index 21baee79c2..ca24aadd2d 100644
+--- a/python/sglang/srt/speculative/dflash_info.py
++++ b/python/sglang/srt/speculative/dflash_info.py
+@@ -180,18 +180,8 @@ class DFlashVerifyInput(SpecInput):
+                 + (self.draft_token_num**2) * bs
+             )
+             if mask.numel() < mask_numel:
+-                # FIXME(attn): temporary fix for custom mask padding with cuda graph
+-                mask = torch.cat(
+-                    [
+-                        mask,
+-                        torch.full(
+-                            (mask_numel - mask.numel(),),
+-                            True,
+-                            dtype=torch.bool,
+-                            device=device,
+-                        ),
+-                    ],
+-                    dim=0,
+-                )
++                mask = torch.full((mask_numel,), True, dtype=torch.bool, device=device)
+                 self.custom_mask = mask
++            else:
++                mask = mask[:mask_numel]
+         return kv_indices, cum_kv_seq_len, qo_indptr, mask
+diff --git a/python/sglang/srt/speculative/eagle_info.py b/python/sglang/srt/speculative/eagle_info.py
+index a927efc8bf..7d8018556f 100644
+--- a/python/sglang/srt/speculative/eagle_info.py
++++ b/python/sglang/srt/speculative/eagle_info.py
+@@ -121,21 +121,11 @@ class EagleVerifyInput(SpecInput):
+             + (self.draft_token_num**2) * batch_size
+         )
+         if self.custom_mask.numel() < mask_numel:
+-            # FIXME(attn): temporary fix for custom mask padding with cuda graph
+-            self.custom_mask = torch.cat(
+-                [
+-                    self.custom_mask,
+-                    torch.full(
+-                        (mask_numel - self.custom_mask.numel(),),
+-                        True,
+-                        dtype=torch.bool,
+-                        device=device,
+-                    ),
+-                ],
+-                dim=0,
++            self.custom_mask = torch.full(
++                (mask_numel,), True, dtype=torch.bool, device=device
+             )
+ 
+-        return kv_indices, cum_kv_seq_len, qo_indptr, self.custom_mask
++        return kv_indices, cum_kv_seq_len, qo_indptr, self.custom_mask[:mask_numel]
+ 
+ 
+ @dataclass
+diff --git a/test/registered/unit/spec/test_custom_mask_no_leak.py b/test/registered/unit/spec/test_custom_mask_no_leak.py
+new file mode 100644
+index 0000000000..b8d0bd411b
+--- /dev/null
++++ b/test/registered/unit/spec/test_custom_mask_no_leak.py
+@@ -0,0 +1,74 @@
++import torch
++
++from sglang.test.ci.ci_register import register_cuda_ci
++
++register_cuda_ci(est_time=5, stage="base-b", runner_config="1-gpu-small")
++
++
++def _make_eagle(topk=4, spec_steps=3, device="cuda"):
++    from sglang.srt.speculative.eagle_info import EagleVerifyInput
++
++    return EagleVerifyInput.create_idle_input(
++        topk=topk,
++        spec_steps=spec_steps,
++        num_verify_tokens=topk * (spec_steps + 1),
++        device=device,
++    )
++
++
++def _make_dflash(draft_token_num=8, device="cuda"):
++    from sglang.srt.speculative.dflash_info import DFlashVerifyInput
++
++    return DFlashVerifyInput(
++        draft_token=torch.empty(0, dtype=torch.long, device=device),
++        positions=torch.empty(0, dtype=torch.int64, device=device),
++        draft_token_num=draft_token_num,
++        custom_mask=torch.full((0,), True, dtype=torch.bool, device=device),
++    )
++
++
++def _call(spec_input, batch_size, device="cuda"):
++    req_pool_indices = torch.arange(batch_size, device=device)
++    paged_kernel_lens = torch.full((batch_size,), 10, dtype=torch.int32, device=device)
++    paged_kernel_lens_sum = int(paged_kernel_lens.sum().item())
++    req_to_token = torch.zeros((batch_size, 20), dtype=torch.int32, device=device)
++    _, _, _, mask = spec_input.generate_attn_arg_prefill(
++        req_pool_indices, paged_kernel_lens, paged_kernel_lens_sum, req_to_token
++    )
++    expected = (
++        paged_kernel_lens_sum * spec_input.draft_token_num
++        + (spec_input.draft_token_num**2) * batch_size
++    )
++    return expected, mask
++
++
++def test_eagle_mask_exact_size():
++    s = _make_eagle()
++    for bs in [4, 8, 2]:
++        expected, mask = _call(s, bs)
++        assert mask.numel() == expected
++
++
++def test_eagle_mask_no_unbounded_growth():
++    s = _make_eagle()
++    for bs in [2, 16, 2, 16, 2, 32, 2]:
++        expected, mask = _call(s, bs)
++        assert mask.numel() == expected
++    _, mask_at_peak = _call(s, 32)
++    assert s.custom_mask.numel() <= mask_at_peak.numel()
++
++
++def test_dflash_mask_exact_size():
++    s = _make_dflash()
++    for bs in [4, 8, 2]:
++        expected, mask = _call(s, bs)
++        assert mask.numel() == expected
++
++
++def test_dflash_mask_no_unbounded_growth():
++    s = _make_dflash()
++    for bs in [2, 16, 2, 16, 2, 32, 2]:
++        expected, mask = _call(s, bs)
++        assert mask.numel() == expected
++    _, mask_at_peak = _call(s, 32)
++    assert s.custom_mask.numel() <= mask_at_peak.numel()
+-- 
+2.34.1
+

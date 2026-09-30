@@ -1,0 +1,25 @@
+From 4fbe88e4f2df55cc9b8bfe1d4488f2fbb97a02dd Mon Sep 17 00:00:00 2001
+From: root <root@MyComputer.localdomain>
+Date: Mon, 31 Aug 2026 04:33:58 +0800
+Subject: [PATCH 25/38] fix: drop dead mamba_track_grid import (not present in
+ fork)
+
+---
+ python/sglang/srt/speculative/dflash_worker_v2.py | 1 -
+ 1 file changed, 1 deletion(-)
+
+diff --git a/python/sglang/srt/speculative/dflash_worker_v2.py b/python/sglang/srt/speculative/dflash_worker_v2.py
+index 95997d5150..a6bf836e87 100644
+--- a/python/sglang/srt/speculative/dflash_worker_v2.py
++++ b/python/sglang/srt/speculative/dflash_worker_v2.py
+@@ -41,7 +41,6 @@ from sglang.srt.runtime_context import (
+     get_exec,
+     get_schedule,
+     get_spec,
+-    mamba_track_grid,
+ )
+ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+ from sglang.srt.server_args import ServerArgs
+-- 
+2.34.1
+

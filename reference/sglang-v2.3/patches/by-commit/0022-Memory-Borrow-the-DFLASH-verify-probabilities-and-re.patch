@@ -1,0 +1,596 @@
+From 27ee95ba62a22ff36803685e309c5a413dd5b2da Mon Sep 17 00:00:00 2001
+From: cctry <cctry@fb.com>
+Date: Fri, 28 Aug 2026 17:37:23 -0700
+Subject: [PATCH 22/38] [Memory] Borrow the DFLASH verify probabilities and
+ rehearse them at startup
+
+Give graph-pool borrowing a live consumer again. The full-vocabulary target
+and draft probability matrices built in the DFLASH non-greedy accept path
+die within their step, so their bytes come out of the graph pool's idle
+storage. The kernel's cached chain buffers move above the scope: they
+outlive the step, and correct_len aliases accept_token_num.
+
+DFlashWorkerV2.prewarm_sampling rehearses that path at the largest verify
+batch after graph capture. An undersized pool now surfaces at startup --
+borrowing is retired and the measured footprint becomes post-capture KV
+sizing headroom -- instead of OOMing under traffic.
+
+Measured on Llama-3.1-8B + DFlash-UltraChat over 4x200 GSM8K examples per
+arm: score 0.7525 (sd 0.021) and accept length 2.80, borrowing on or off.
+---
+ .../kv_pool_runtime.py                        |   8 ++
+ python/sglang/srt/speculative/dflash_utils.py | 121 +++++++++--------
+ .../srt/speculative/dflash_worker_v2.py       | 127 +++++++++++++++++-
+ python/sglang/test/kits/eval_accuracy_kit.py  |   6 +
+ test/registered/spec/dflash/test_dflash.py    |  42 +++++-
+ .../runner_utils/test_graph_pool_borrow.py    | 113 +++++++++++++++-
+ 6 files changed, 354 insertions(+), 63 deletions(-)
+
+diff --git a/python/sglang/srt/model_executor/model_runner_components/kv_pool_runtime.py b/python/sglang/srt/model_executor/model_runner_components/kv_pool_runtime.py
+index 9be8dfb43b..a600b9f13c 100644
+--- a/python/sglang/srt/model_executor/model_runner_components/kv_pool_runtime.py
++++ b/python/sglang/srt/model_executor/model_runner_components/kv_pool_runtime.py
+@@ -10,6 +10,7 @@ from sglang.srt.configs.hybrid_arch import mambaish_config
+ from sglang.srt.distributed import get_world_group
+ from sglang.srt.mem_cache.kv_cache_configurator import mm_runtime_reservation_gb
+ from sglang.srt.model_executor.cuda_graph_config import Backend
++from sglang.srt.model_executor.runner_utils.pool import graph_pool_borrow_enabled
+ from sglang.srt.platforms import current_platform
+ from sglang.srt.runtime_context import pre_capture_activation_reserve_mb
+ from sglang.srt.utils.common import get_available_gpu_memory, get_device_memory_capacity
+@@ -78,6 +79,13 @@ def compute_post_capture_kv_resize(
+             )
+             / 1024,
+         )
++    if not graph_pool_borrow_enabled():
++        # Borrowing serves the sampling temporaries out of idle graph storage;
++        # without it they need real headroom the KV pool must not claim.
++        headroom_gb = max(
++            headroom_gb,
++            model_runner.sampling_prewarm_result.sampling_headroom_bytes / (1 << 30),
++        )
+     mm_reservation_gb = mm_runtime_reservation_gb(
+         is_multimodal=model_runner.model_config.is_multimodal,
+         mm_feature_transport=model_runner.server_args.mm_feature_transport,
+diff --git a/python/sglang/srt/speculative/dflash_utils.py b/python/sglang/srt/speculative/dflash_utils.py
+index f8ce936c5d..65df21bb01 100644
+--- a/python/sglang/srt/speculative/dflash_utils.py
++++ b/python/sglang/srt/speculative/dflash_utils.py
+@@ -17,6 +17,7 @@ from sglang.srt.layers.sampler import (
+     top_p_normalize_probs_torch,
+ )
+ from sglang.srt.managers.schedule_batch import Req
++from sglang.srt.model_executor.runner_utils.pool import borrow_graph_pool
+ from sglang.srt.speculative.spec_utils import sample_simulated_acc_len
+ from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu
+ 
+@@ -883,44 +884,22 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
+ 
+     device = next_token_logits.device
+ 
+-    if uniform_samples is None:
+-        uniform_samples = torch.rand(
+-            (bs, draft_token_num), dtype=torch.float32, device=device
+-        )
+-    else:
+-        if uniform_samples.shape != (bs, draft_token_num):
+-            raise ValueError(
+-                "uniform_samples shape mismatch. "
+-                f"Expected {(bs, draft_token_num)}, got {tuple(uniform_samples.shape)}."
+-            )
+-        uniform_samples = uniform_samples.to(device=device, dtype=torch.float32)
+-
+-    if uniform_samples_for_final_sampling is None:
+-        uniform_samples_for_final_sampling = torch.rand(
+-            (bs,), dtype=torch.float32, device=device
++    if uniform_samples is not None and uniform_samples.shape != (bs, draft_token_num):
++        raise ValueError(
++            "uniform_samples shape mismatch. "
++            f"Expected {(bs, draft_token_num)}, got {tuple(uniform_samples.shape)}."
+         )
+-    else:
+-        if uniform_samples_for_final_sampling.shape != (bs,):
+-            raise ValueError(
+-                "uniform_samples_for_final_sampling shape mismatch. "
+-                f"Expected {(bs,)}, got {tuple(uniform_samples_for_final_sampling.shape)}."
+-            )
+-        uniform_samples_for_final_sampling = uniform_samples_for_final_sampling.to(
+-            device=device,
+-            dtype=torch.float32,
++    if (
++        uniform_samples_for_final_sampling is not None
++        and uniform_samples_for_final_sampling.shape != (bs,)
++    ):
++        raise ValueError(
++            "uniform_samples_for_final_sampling shape mismatch. "
++            f"Expected {(bs,)}, got {tuple(uniform_samples_for_final_sampling.shape)}."
+         )
+ 
+-    target_probs = build_dflash_verify_target_probs(
+-        next_token_logits=next_token_logits,
+-        sampling_info=sampling_info,
+-        draft_token_num=draft_token_num,
+-        bs=bs,
+-        max_top_k=max_top_k,
+-        uniform_top_k_value=uniform_top_k_value,
+-        use_sparse_topk=use_sparse_topk,
+-    )
+-    draft_probs = torch.zeros_like(target_probs)
+-
++    # Cached across steps, and `correct_len` below aliases `accept_token_num`,
++    # so these must predate the borrow scope the next replay reclaims.
+     (
+         retrieve_index,
+         retrieve_next_token,
+@@ -933,25 +912,59 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
+         draft_token_num=draft_token_num,
+         device=device,
+     )
+-    candidates_i64 = (
+-        candidates if candidates.dtype == torch.int64 else candidates.to(torch.int64)
+-    )
+-    tree_speculative_sampling_target_only(
+-        predicts=predicts,
+-        accept_index=accept_index,
+-        accept_token_num=accept_token_num,
+-        candidates=candidates_i64,
+-        retrive_index=retrieve_index,
+-        retrive_next_token=retrieve_next_token,
+-        retrive_next_sibling=retrieve_next_sibling,
+-        uniform_samples=uniform_samples,
+-        uniform_samples_for_final_sampling=uniform_samples_for_final_sampling,
+-        target_probs=target_probs,
+-        draft_probs=draft_probs,
+-        threshold_single=threshold_single,
+-        threshold_acc=threshold_acc,
+-        deterministic=True,
+-    )
++
++    # The full-vocabulary matrices die with this step, so their bytes may come
++    # from the graph pool's idle storage. Anything outliving the scope is not.
++    with borrow_graph_pool(user="DFLASH verify probabilities"):
++        if uniform_samples is None:
++            coins = torch.rand(
++                (bs, draft_token_num), dtype=torch.float32, device=device
++            )
++        else:
++            coins = uniform_samples.to(device=device, dtype=torch.float32)
++        if uniform_samples_for_final_sampling is None:
++            coins_for_final_sampling = torch.rand(
++                (bs,), dtype=torch.float32, device=device
++            )
++        else:
++            coins_for_final_sampling = uniform_samples_for_final_sampling.to(
++                device=device,
++                dtype=torch.float32,
++            )
++
++        target_probs = build_dflash_verify_target_probs(
++            next_token_logits=next_token_logits,
++            sampling_info=sampling_info,
++            draft_token_num=draft_token_num,
++            bs=bs,
++            max_top_k=max_top_k,
++            uniform_top_k_value=uniform_top_k_value,
++            use_sparse_topk=use_sparse_topk,
++        )
++        draft_probs = torch.zeros_like(target_probs)
++        candidates_i64 = (
++            candidates
++            if candidates.dtype == torch.int64
++            else candidates.to(torch.int64)
++        )
++        tree_speculative_sampling_target_only(
++            predicts=predicts,
++            accept_index=accept_index,
++            accept_token_num=accept_token_num,
++            candidates=candidates_i64,
++            retrive_index=retrieve_index,
++            retrive_next_token=retrieve_next_token,
++            retrive_next_sibling=retrieve_next_sibling,
++            uniform_samples=coins,
++            uniform_samples_for_final_sampling=coins_for_final_sampling,
++            target_probs=target_probs,
++            draft_probs=draft_probs,
++            threshold_single=threshold_single,
++            threshold_acc=threshold_acc,
++            deterministic=True,
++        )
++        del target_probs, draft_probs, candidates_i64
++        del coins, coins_for_final_sampling
+ 
+     correct_len = accept_token_num
+     row_ids = torch.arange(bs, dtype=torch.long, device=device)
+diff --git a/python/sglang/srt/speculative/dflash_worker_v2.py b/python/sglang/srt/speculative/dflash_worker_v2.py
+index 0b05e32094..95997d5150 100644
+--- a/python/sglang/srt/speculative/dflash_worker_v2.py
++++ b/python/sglang/srt/speculative/dflash_worker_v2.py
+@@ -32,12 +32,24 @@ from sglang.srt.model_executor.forward_batch_info import (
+     ForwardMode,
+     compute_position,
+ )
+-from sglang.srt.runtime_context import get_exec, get_schedule
++from sglang.srt.model_executor.model_runner import SamplingPrewarmResult
++from sglang.srt.model_executor.runner_utils.pool import (
++    disable_graph_pool_borrow,
++    graph_pool_borrow_enabled,
++)
++from sglang.srt.runtime_context import (
++    get_exec,
++    get_schedule,
++    get_spec,
++    mamba_track_grid,
++)
++from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+ from sglang.srt.server_args import ServerArgs
+ from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+ from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+ from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+ from sglang.srt.speculative.dflash_utils import (
++    _get_or_create_chain_verify_buffers,
+     apply_dflash_simulated_acceptance,
+     apply_dflash_verify_logits_adjustments,
+     can_dflash_use_fused_qkv_proj,
+@@ -470,6 +482,119 @@ class DFlashWorkerV2(BaseSpecWorker):
+             capture_decode_cuda_graph=capture_decode_cuda_graph
+         )
+ 
++    def _prewarm_batch_size(self, block_size: int) -> int:
++        """Largest batch the non-greedy verify path can see in one step."""
++        bs = self.model_runner.max_decode_logits_rows() // block_size
++        max_running_requests = self.model_runner.max_running_requests
++        if max_running_requests is not None:
++            bs = min(bs, int(max_running_requests))
++        return max(1, bs)
++
++    def _measure_sampling_peak(
++        self,
++        *,
++        candidates: torch.Tensor,
++        target_logits: torch.Tensor,
++        sampling_info: SamplingBatchInfo,
++    ) -> int:
++        torch.cuda.synchronize()
++        torch.cuda.reset_peak_memory_stats()
++        base_bytes = torch.cuda.memory_stats()["allocated_bytes.all.current"]
++        compute_dflash_sampling_correct_drafts_and_bonus(
++            candidates=candidates,
++            next_token_logits=target_logits,
++            sampling_info=sampling_info,
++            max_top_k=None,
++            uniform_top_k_value=None,
++        )
++        torch.cuda.synchronize()
++        return torch.cuda.memory_stats()["allocated_bytes.all.peak"] - base_bytes
++
++    def prewarm_sampling(self) -> SamplingPrewarmResult:
++        """Rehearse the non-greedy verify path so an undersized graph-pool
++        borrow surfaces at startup rather than under traffic."""
++        if not is_cuda() or not is_dflash_sampling_verify_available():
++            return self.model_runner.prewarm_sampling()
++
++        block_size = int(self.block_size)
++        vocab_size = self.model_config.vocab_size
++        bs = self._prewarm_batch_size(block_size)
++        device = self.device
++
++        sampling_info = SamplingBatchInfo(
++            temperatures=torch.ones((bs, 1), dtype=torch.float32, device=device),
++            top_ps=torch.full((bs,), 0.95, dtype=torch.float32, device=device),
++            top_ks=torch.zeros(bs, dtype=torch.int32, device=device),
++            min_ps=torch.zeros(bs, dtype=torch.float32, device=device),
++            is_all_greedy=False,
++            is_any_greedy=False,
++            need_top_p_sampling=True,
++            # Top-k off: the sparse path is cheaper, so the dense full-vocab
++            # renormalization is the peak this rehearsal has to reproduce.
++            need_top_k_sampling=False,
++            need_min_p_sampling=False,
++            vocab_size=vocab_size,
++        )
++        candidates = torch.zeros((bs, block_size), dtype=torch.int64, device=device)
++        target_logits = torch.zeros(
++            (bs * block_size, vocab_size), dtype=torch.float32, device=device
++        )
++
++        # Size the process-lifetime chain buffers before anything borrows. The
++        # cache is keyed on device index, so pass the resolved device, not "cuda".
++        _get_or_create_chain_verify_buffers(
++            bs=bs, draft_token_num=block_size, device=target_logits.device
++        )
++        # One unborrowed pass, so any workspace a kernel caches for the process
++        # lifetime lands outside graph storage and off the measured peak.
++        with envs.SGLANG_ENABLE_GRAPH_POOL_BORROW.override(False):
++            self._measure_sampling_peak(
++                candidates=candidates,
++                target_logits=target_logits,
++                sampling_info=sampling_info,
++            )
++
++        borrowing = graph_pool_borrow_enabled()
++        try:
++            peak_bytes = self._measure_sampling_peak(
++                candidates=candidates,
++                target_logits=target_logits,
++                sampling_info=sampling_info,
++            )
++        except torch.OutOfMemoryError:
++            if not borrowing:
++                raise
++            reason = (
++                "DFLASH sampling rehearsal exhausted graph-pool memory for the "
++                f"{bs}x{block_size}x{vocab_size} verify probability matrices"
++            )
++            logger.warning(
++                "Graph pool %s; disabling borrowing and reserving the measured "
++                "headroom in the post-capture KV sizing instead",
++                reason,
++            )
++            disable_graph_pool_borrow(reason)
++            peak_bytes = self._measure_sampling_peak(
++                candidates=candidates,
++                target_logits=target_logits,
++                sampling_info=sampling_info,
++            )
++
++        sampling_input_bytes = target_logits.numel() * target_logits.element_size()
++        result = SamplingPrewarmResult(
++            sampling_input_bytes=sampling_input_bytes,
++            sampling_headroom_bytes=peak_bytes + sampling_input_bytes,
++        )
++        self.model_runner.sampling_prewarm_result = result
++        logger.info(
++            "DFLASH sampling pre-warm: borrowing=%s bs=%d peak=%d B headroom=%d B",
++            graph_pool_borrow_enabled(),
++            bs,
++            peak_bytes,
++            result.sampling_headroom_bytes,
++        )
++        return result
++
+     def _maybe_build_draft_sampler(self):
+         def _eager(reason):
+             if self.ps.tp_rank == 0:
+diff --git a/python/sglang/test/kits/eval_accuracy_kit.py b/python/sglang/test/kits/eval_accuracy_kit.py
+index b865dba9d4..e1b6c8b97f 100644
+--- a/python/sglang/test/kits/eval_accuracy_kit.py
++++ b/python/sglang/test/kits/eval_accuracy_kit.py
+@@ -192,6 +192,10 @@ class GSM8KMixin:
+     gsm8k_backend: str = "run_eval"  # "run_eval" | "sgl_eval"
+     gsm8k_thinking: bool = False  # sgl_eval backend
+     gsm8k_n_repeats: int = 1  # sgl_eval backend
++    # None keeps run_eval's greedy default; set both to route the run through
++    # the sampling path.
++    gsm8k_temperature: Optional[float] = None
++    gsm8k_top_p: Optional[float] = None
+ 
+     def test_gsm8k(self):
+         requests.get(self.base_url + "/flush_cache")
+@@ -225,6 +229,8 @@ class GSM8KMixin:
+                 api="completion",
+                 max_tokens=512,
+                 num_shots=self.gsm8k_num_shots,
++                temperature=self.gsm8k_temperature,
++                top_p=self.gsm8k_top_p,
+             )
+ 
+ 
+diff --git a/test/registered/spec/dflash/test_dflash.py b/test/registered/spec/dflash/test_dflash.py
+index cd49e3e1a5..3c831eb3e4 100644
+--- a/test/registered/spec/dflash/test_dflash.py
++++ b/test/registered/spec/dflash/test_dflash.py
+@@ -1,4 +1,5 @@
+ import unittest
++from contextlib import ExitStack
+ 
+ import openai
+ 
+@@ -22,7 +23,7 @@ from sglang.test.test_utils import (
+     popen_launch_server,
+ )
+ 
+-register_cuda_ci(est_time=420, stage="base-b", runner_config="1-gpu-small")
++register_cuda_ci(est_time=500, stage="base-b", runner_config="1-gpu-small")
+ register_amd_ci(est_time=420, stage="stage-b", runner_config="1-gpu-small-amd")
+ 
+ 
+@@ -45,6 +46,8 @@ class TestDFlashServerBase(
+     draft_model = DEFAULT_DRAFT_MODEL_DFLASH
+     gsm8k_accuracy_thres = 0.75
+     gsm8k_accept_length_thres = 2.8
++    # (env, value) pairs applied around the server launch.
++    extra_env_overrides: tuple = ()
+ 
+     @classmethod
+     def setUpClass(cls):
+@@ -71,12 +74,15 @@ class TestDFlashServerBase(
+         if cls.disable_overlap:
+             launch_args.append("--disable-overlap-schedule")
+         launch_args.extend(cls.other_launch_args)
+-        with (
+-            envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.override(cls.overlap_plan_stream),
+-            envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(1),
+-            envs.SGLANG_ENABLE_ASYNC_ASSERT.override(True),
+-            envs.SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN.override(True),
+-        ):
++        with ExitStack() as stack:
++            for env, value in (
++                (envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM, cls.overlap_plan_stream),
++                (envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),
++                (envs.SGLANG_ENABLE_ASYNC_ASSERT, True),
++                (envs.SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN, True),
++                *cls.extra_env_overrides,
++            ):
++                stack.enter_context(env.override(value))
+             cls.process = popen_launch_server(
+                 cls.model,
+                 cls.base_url,
+@@ -173,5 +179,27 @@ class TestDFlashServerOverlapPlanStream(TestDFlashServerOverlap):
+     overlap_plan_stream = True
+ 
+ 
++@unittest.skipIf(
++    is_hip(),
++    "borrowing is CUDA-only and ROCm has no DFLASH sampling-verify kernel",
++)
++class TestDFlashServerGraphPoolBorrow(TestDFlashServerBase):
++    """Verify probabilities served out of idle CUDA graph storage. Only the
++    non-greedy accept path borrows, hence the sampled GSM8K below."""
++
++    extra_env_overrides = (
++        (envs.SGLANG_ENABLE_GRAPH_POOL_BORROW, 1),
++        (envs.SGLANG_ENABLE_GRAPH_POOL_PRECARVE, 1),
++    )
++    disable_overlap = False
++    gsm8k_temperature = 0.6
++    gsm8k_top_p = 0.95
++    # Measured over 4x200 examples per arm: score 0.7525 (sd 0.021) and accept
++    # length 2.80, borrowing on or off. Corruption collapses accept length
++    # toward 1.0; the accuracy floor is loose to absorb other hardware.
++    gsm8k_accuracy_thres = 0.60
++    gsm8k_accept_length_thres = 2.0
++
++
+ if __name__ == "__main__":
+     unittest.main()
+diff --git a/test/registered/unit/model_executor/runner_utils/test_graph_pool_borrow.py b/test/registered/unit/model_executor/runner_utils/test_graph_pool_borrow.py
+index 45918f534d..ab86a4b134 100644
+--- a/test/registered/unit/model_executor/runner_utils/test_graph_pool_borrow.py
++++ b/test/registered/unit/model_executor/runner_utils/test_graph_pool_borrow.py
+@@ -1,6 +1,7 @@
+ """CUDA graph-pool borrowing allocator and lifetime regression tests."""
+ 
+ import unittest
++from contextlib import contextmanager
+ from types import SimpleNamespace
+ from unittest.mock import MagicMock, Mock, patch
+ 
+@@ -11,7 +12,8 @@ from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
+     FullCudaGraphBackend,
+ )
+ from sglang.srt.model_executor.runner_utils import pool
+-from sglang.srt.speculative import eagle_utils
++from sglang.srt.speculative import dflash_utils, dflash_worker_v2, eagle_utils
++from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+ from sglang.test.ci.ci_register import register_cuda_ci
+ from sglang.test.test_utils import CustomTestCase
+ 
+@@ -351,6 +353,115 @@ class TestGraphPoolBorrow(CustomTestCase):
+ 
+         del graph, y
+ 
++    def test_dflash_verify_output_buffers_predate_the_borrow_scope(self):
++        """The chain verify buffers outlive the step, so creating them inside
++        the borrow scope would let the next replay overwrite the accept
++        length instead of raising."""
++        events = []
++
++        @contextmanager
++        def recording_borrow(user):
++            events.append(f"borrow:{user}")
++            yield
++            events.append("release")
++
++        real_buffers = dflash_utils._get_or_create_chain_verify_buffers
++
++        def recording_buffers(**kwargs):
++            events.append("buffers")
++            return real_buffers(**kwargs)
++
++        def fake_sampling(**kwargs):
++            kwargs["predicts"].fill_(3)
++            kwargs["accept_index"].fill_(0)
++            kwargs["accept_token_num"].fill_(1)
++
++        sampling_info = SimpleNamespace(
++            temperatures=torch.ones((1, 1)),
++            top_ks=torch.ones(1, dtype=torch.int32),
++            top_ps=torch.ones(1),
++            need_top_k_sampling=False,
++            need_top_p_sampling=False,
++        )
++        with (
++            patch.object(dflash_utils, "borrow_graph_pool", recording_borrow),
++            patch.object(
++                dflash_utils,
++                "_get_or_create_chain_verify_buffers",
++                recording_buffers,
++            ),
++            patch.object(dflash_utils, "_DFLASH_SAMPLING_VERIFY_AVAILABLE", True),
++            patch.object(
++                dflash_utils,
++                "tree_speculative_sampling_target_only",
++                fake_sampling,
++            ),
++        ):
++            correct_len, bonus = (
++                dflash_utils.compute_dflash_sampling_correct_drafts_and_bonus(
++                    candidates=torch.zeros((1, 2), dtype=torch.int64),
++                    next_token_logits=torch.randn((2, 8)),
++                    sampling_info=sampling_info,
++                    threshold_single=1.0,
++                    threshold_acc=1.0,
++                )
++            )
++
++        self.assertEqual(
++            events, ["buffers", "borrow:DFLASH verify probabilities", "release"]
++        )
++        self.assertTrue(torch.equal(correct_len, torch.ones_like(correct_len)))
++        self.assertTrue(torch.equal(bonus, torch.full_like(bonus, 3)))
++
++    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
++    def test_dflash_prewarm_falls_back_when_the_rehearsal_exhausts_the_pool(self):
++        """A rehearsal too large for the pool must retire borrowing and
++        re-measure, rather than crash startup or leave KV sizing without the
++        headroom it now has to reserve."""
++        worker = object.__new__(DFlashWorkerV2)
++        worker.block_size = 4
++        worker.device = "cuda"
++        worker._target_worker = SimpleNamespace(
++            model_runner=SimpleNamespace(
++                max_running_requests=2,
++                max_decode_logits_rows=lambda: 8,
++                sampling_prewarm_result=None,
++            ),
++            model_config=SimpleNamespace(vocab_size=32),
++        )
++        worker.model_runner = worker._target_worker.model_runner
++
++        calls = []
++
++        def rehearse(**kwargs):
++            calls.append(pool.graph_pool_borrow_enabled())
++            if len(calls) == 2:
++                raise torch.OutOfMemoryError("rehearsal too large")
++            return torch.zeros(2), torch.zeros(2)
++
++        with (
++            envs.SGLANG_ENABLE_GRAPH_POOL_BORROW.override(True),
++            patch.object(pool, "get_global_graph_memory_pool", return_value=(1, 2)),
++            patch.object(
++                dflash_worker_v2,
++                "compute_dflash_sampling_correct_drafts_and_bonus",
++                rehearse,
++            ),
++        ):
++            self.assertTrue(pool.graph_pool_borrow_enabled())
++            result = worker.prewarm_sampling()
++            self.assertFalse(pool.graph_pool_borrow_enabled())
++
++        # Warm pass outside the pool, borrowed pass that OOMs, retry after the
++        # fallback retires borrowing.
++        self.assertEqual(calls, [False, True, False])
++        # 2 rows x 4 draft tokens x 32 vocab x 4 bytes.
++        self.assertEqual(result.sampling_input_bytes, 2 * 4 * 32 * 4)
++        self.assertGreaterEqual(
++            result.sampling_headroom_bytes, result.sampling_input_bytes
++        )
++        self.assertIs(worker.model_runner.sampling_prewarm_result, result)
++
+ 
+ if __name__ == "__main__":
+     unittest.main()
+-- 
+2.34.1
+

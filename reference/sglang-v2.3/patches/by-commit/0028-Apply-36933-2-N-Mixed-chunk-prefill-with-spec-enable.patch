@@ -1,0 +1,616 @@
+From cde46603e603b74e5fef98ee5b3dfb2c83d95a93 Mon Sep 17 00:00:00 2001
+From: root <root@MyComputer.localdomain>
+Date: Mon, 31 Aug 2026 10:53:18 +0800
+Subject: [PATCH 28/38] Apply #36933 [2/N] Mixed chunk prefill with spec
+ enabled (squash)
+
+---
+ .../sglang/srt/arg_groups/speculative_hook.py |  32 ++--
+ .../sglang/srt/arg_groups/validation_hook.py  |  12 +-
+ python/sglang/srt/managers/overlap_utils.py   |  59 ++++++++
+ python/sglang/srt/managers/schedule_batch.py  |  53 ++++++-
+ python/sglang/srt/managers/scheduler.py       |  19 ++-
+ .../batch_result_processor.py                 |   9 ++
+ .../srt/speculative/dflash_worker_v2.py       |   6 +-
+ .../dspark_components/dspark_worker_v2.py     |   6 +-
+ .../sglang/srt/speculative/eagle_worker_v2.py |   1 +
+ python/sglang/srt/speculative/spec_info.py    |  13 ++
+ .../sglang/srt/speculative/spec_registry.py   |   3 +
+ test/registered/spec/test_spec_mixed_chunk.py | 139 ++++++++++++++++++
+ .../test_schedule_batch_out_of_place.py       |   7 +
+ .../spec/test_decode_bookkeeping_ownership.py |   7 +
+ 14 files changed, 331 insertions(+), 35 deletions(-)
+ create mode 100644 test/registered/spec/test_spec_mixed_chunk.py
+
+diff --git a/python/sglang/srt/arg_groups/speculative_hook.py b/python/sglang/srt/arg_groups/speculative_hook.py
+index 7083af6c1a..b8b4b10641 100644
+--- a/python/sglang/srt/arg_groups/speculative_hook.py
++++ b/python/sglang/srt/arg_groups/speculative_hook.py
+@@ -326,16 +326,6 @@ def _handle_dflash(server_args: ServerArgs) -> None:
+             "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
+         )
+ 
+-    if cfg.enable_mixed_chunk:
+-        declare_resolution(
+-            server_args,
+-            "_handle_dflash",
+-            enable_mixed_chunk=False,
+-        )
+-        logger.warning(
+-            "Mixed chunked prefill is disabled because of using dflash speculative decoding."
+-        )
+-
+ 
+ def _target_checkpoint_bundles_dspark_draft(server_args: ServerArgs) -> bool:
+     from sglang.srt.speculative.dspark_components.dspark_config import (
+@@ -524,16 +514,6 @@ def _handle_dspark(server_args: ServerArgs) -> None:
+             "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
+         )
+ 
+-    if cfg.enable_mixed_chunk:
+-        declare_resolution(
+-            server_args,
+-            "_handle_dspark",
+-            enable_mixed_chunk=False,
+-        )
+-        logger.warning(
+-            "Mixed chunked prefill is disabled because of using dspark speculative decoding."
+-        )
+-
+     from sglang.srt.speculative.ragged_verify import (
+         RaggedVerifyMode,
+         read_ragged_verify_mode,
+@@ -688,15 +668,21 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
+             "speculative decoding."
+         )
+ 
+-    if cfg.enable_mixed_chunk:
++    # Mixed steps degrade running requests to a plain 1-token decode; see
++    # SpeculativeAlgorithm.supports_mixed_chunk for which workers handle it.
++    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
++
++    algo = SpeculativeAlgorithm.from_string(cfg.speculative_algorithm)
++    if cfg.enable_mixed_chunk and not algo.supports_mixed_chunk():
+         declare_resolution(
+             server_args,
+             "_handle_eagle_family",
+             enable_mixed_chunk=False,
+         )
+         logger.warning(
+-            "Mixed chunked prefill is disabled because of using "
+-            "eagle speculative decoding."
++            "Mixed chunked prefill is disabled: %s speculative decoding does "
++            "not support it.",
++            cfg.speculative_algorithm,
+         )
+ 
+     model_arch = model_config_of(server_args).hf_config.architectures[0]
+diff --git a/python/sglang/srt/arg_groups/validation_hook.py b/python/sglang/srt/arg_groups/validation_hook.py
+index e70af6594b..e02cccded7 100644
+--- a/python/sglang/srt/arg_groups/validation_hook.py
++++ b/python/sglang/srt/arg_groups/validation_hook.py
+@@ -84,9 +84,19 @@ def check_server_args(server_args: Any):
+ 
+     # Check speculative decoding
+     if cfg.speculative_algorithm is not None:
++        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
++
++        # Running requests degrade to a plain 1-token decode inside a
++        # mixed step; only workers with a verified resume path allow it.
+         assert (
+             not cfg.enable_mixed_chunk
+-        ), "enable_mixed_chunk is required for speculative decoding"
++            or SpeculativeAlgorithm.from_string(
++                cfg.speculative_algorithm
++            ).supports_mixed_chunk()
++        ), (
++            "enable_mixed_chunk is not supported with "
++            f"speculative_algorithm={cfg.speculative_algorithm}"
++        )
+ 
+     # Check chunked prefill
+     # Skip validation if chunked prefill is disabled (i.e., size <= 0).
+diff --git a/python/sglang/srt/managers/overlap_utils.py b/python/sglang/srt/managers/overlap_utils.py
+index 3433f6c986..4062e8f56f 100644
+--- a/python/sglang/srt/managers/overlap_utils.py
++++ b/python/sglang/srt/managers/overlap_utils.py
+@@ -93,6 +93,8 @@ def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
+     if batch.prefill_input_ids_cpu is not None:
+         prefill_gpu = batch.prefill_input_ids_cpu.to(batch.device, non_blocking=True)
+         if batch.mix_running_indices is not None:
++            if batch.enable_overlap and not batch.spec_algorithm.is_none():
++                future_map.resolve_mixed_spec_tails(batch)
+             decode_gpu = future_map.output_tokens_buf[batch.mix_running_indices]
+             if _DEBUG_ASSERT:
+                 _assert_nonneg_and_invalidate(
+@@ -267,6 +269,8 @@ class FutureMap:
+         self.needs_cpu_seq_lens = needs_cpu_seq_lens
+         self.needs_confidence_relay = needs_confidence_relay
+         self.req_pool_size = req_to_token_pool.req_to_token.shape[0]
++        # Kept for the mixed-tail late binding (reserved-slot gather).
++        self.req_to_token = req_to_token_pool.req_to_token
+ 
+         if _DEBUG_ASSERT:
+             # Poisoned init: every row must be written before its first gather.
+@@ -457,6 +461,61 @@ class FutureMap:
+                 draft_input.bonus_tokens, self.output_tokens_buf, indices
+             )
+ 
++    def stash_bonus_tokens(
++        self, indices: torch.Tensor, bonus_tokens: torch.Tensor
++    ) -> None:
++        """Write only output_tokens_buf rows; for relays carrying no draft
++        extras (stash() would lazy-init the spec bufs from the payload)."""
++        self.output_tokens_buf[indices] = bonus_tokens.to(self.output_tokens_buf.dtype)
++
++    def resolve_mixed_spec_tails(self, batch: ScheduleBatch) -> None:
++        """Late-bind a spec mixed batch's decode tails (overlap): schedule
++        time pinned them at a base that lags the in-flight step by its accept
++        count. Gather the settled committed lengths behind the publish fence
++        and rebuild the tail rows: seq_lens (base + 1 for the bonus token),
++        out_cache_loc (the reserved slot at base), and the CPU mirrors the
++        extend metadata reads (prefix_lens, seq_lens_cpu, seq_lens_sum).
++        The bonus-token input ids gather stays with the caller."""
++        idx = batch.mix_running_indices
++        n = int(idx.shape[0])
++        if n == 0:
++            return
++        if self.publish_ready is not None:
++            if _is_hip:
++                self.publish_ready.synchronize()
++            else:
++                self.publish_ready.wait()
++        fresh = self.new_seq_lens_buf[idx]
++        seq_lens = batch.seq_lens.clone()
++        seq_lens[-n:] = fresh + 1
++        batch.seq_lens = seq_lens
++        out_cache_loc = batch.out_cache_loc.clone()
++        out_cache_loc[-n:] = self.req_to_token[idx.long(), fresh.long()].to(
++            out_cache_loc.dtype
++        )
++        batch.out_cache_loc = out_cache_loc
++
++        if self.fwd_prepare_d2h_stream is None or self.publish_ready is None:
++            fresh_cpu = fresh.cpu()  # bootstrap / non-CUDA
++        else:
++            self.fwd_prepare_d2h_stream.wait_event(self.publish_ready)
++            with torch.get_device_module(self.device).stream(
++                self.fwd_prepare_d2h_stream
++            ):
++                self.new_seq_lens_cpu_pinned.copy_(
++                    self.new_seq_lens_buf, non_blocking=True
++                )
++            self.fwd_prepare_d2h_stream.synchronize()
++            fresh_cpu = self.new_seq_lens_cpu_pinned[batch.mix_running_indices_cpu]
++        if batch.seq_lens_cpu is not None:
++            seq_lens_cpu = batch.seq_lens_cpu.clone()
++            seq_lens_cpu[-n:] = fresh_cpu + 1
++            batch.seq_lens_cpu = seq_lens_cpu
++            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
++        batch.prefix_lens = batch.prefix_lens[:-n] + [
++            int(x) for x in fresh_cpu.tolist()
++        ]
++
+     def resolve_seq_lens_cpu(self, batch: ScheduleBatch) -> None:
+         # Lazy pull from new_seq_lens_buf for spec_v2 (accept_lens not known to
+         # schedule). The CPU mirror is gated by needs_cpu_seq_lens; backends that
+diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
+index d864e55bb7..2ee3e0de32 100755
+--- a/python/sglang/srt/managers/schedule_batch.py
++++ b/python/sglang/srt/managers/schedule_batch.py
+@@ -2144,6 +2144,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+     # Staging consumed by resolve_forward_inputs (prefill H2D / mixed gather).
+     prefill_input_ids_cpu: Optional[torch.Tensor] = None
+     mix_running_indices: Optional[torch.Tensor] = None
++    # CPU twin of mix_running_indices; lets the overlap tail resolve gather
++    # pinned mirrors without a device sync.
++    mix_running_indices_cpu: Optional[torch.Tensor] = None
+     input_embeds: torch.Tensor = None  # shape: [b, hidden_size], float32
+ 
+     # Token replacement embeddings and absolute positions (optional).
+@@ -2839,13 +2842,55 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+         # Decode tokens of the running portion live in future_map.output_tokens_buf.
+         self.input_ids = None
+         self.mix_running_indices = running_batch.req_pool_indices
+-        out_cache_loc = torch.cat([self.out_cache_loc, running_batch.out_cache_loc])
++        self.mix_running_indices_cpu = running_batch.req_pool_indices_cpu
++        if not self.spec_algorithm.is_none():
++            # Spec keeps no per-step out_cache_loc on the running batch; gather
++            # each tail's bonus slot at the committed length (rebound under overlap).
++            tail_base = torch.tensor(
++                [r.seqlen - 1 for r in running_batch.reqs],
++                dtype=torch.int64,
++                device=self.seq_lens.device,
++            )
++            running_out_cache_loc = self.req_to_token_pool.req_to_token[
++                running_batch.req_pool_indices.long(),
++                tail_base,
++            ].to(self.out_cache_loc.dtype)
++            # The spec relay is unresolved at schedule time, so merge_batch
++            # would null seq_lens_cpu; rebuild the tails from request state.
++            running_seq_lens_cpu = torch.tensor(
++                [int(r.seqlen) for r in running_batch.reqs], dtype=torch.int64
++            )
++            if self.seq_lens_cpu is None:
++                merged_seq_lens_cpu = running_seq_lens_cpu
++            else:
++                merged_seq_lens_cpu = torch.cat(
++                    [self.seq_lens_cpu, running_seq_lens_cpu]
++                )
++        else:
++            # Non-spec: the running batch carries prepared seq_lens_cpu
++            # (r.seqlen lags it under overlap); merge_batch concats it.
++            tail_base = None
++            running_out_cache_loc = running_batch.out_cache_loc
++            merged_seq_lens_cpu = None
++        out_cache_loc = torch.cat([self.out_cache_loc, running_out_cache_loc])
+ 
+         self.merge_batch(running_batch)
+         self.out_cache_loc = out_cache_loc
+-
+-        # For overlap scheduler, the output_ids has one step delay
+-        delta = 0 if self.enable_overlap else -1
++        if merged_seq_lens_cpu is not None:
++            self.seq_lens_cpu = merged_seq_lens_cpu
++        if tail_base is not None:
++            # Spec seq_lens sit at the committed base (bonus token pending);
++            # this step commits it, so tails carry base + 1 or attention drops the row.
++            merged = self.seq_lens.clone()
++            merged[-running_bs:] = tail_base + 1
++            self.seq_lens = merged
++
++        # For overlap scheduler, the output_ids has one step delay;
++        # spec tail request state carries no delay in either mode.
++        if self.spec_algorithm.is_none():
++            delta = 0 if self.enable_overlap else -1
++        else:
++            delta = -1
+ 
+         # NOTE: prefix_indices is what has been cached, but we don't cache each decode step
+         self.prefix_lens = self.prefix_lens + [
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index 197cb570f3..e09178652e 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -3687,9 +3687,22 @@ class Scheduler(
+                 running_batch.prepare_for_decode()
+                 new_batch.mix_with_running(running_batch)
+                 new_batch.decoding_reqs = running_batch.reqs
+-            running_batch = ScheduleBatch(
+-                reqs=[], batch_is_full=running_batch.batch_is_full
+-            )
++                if not self.enable_overlap and not self.spec_algorithm.is_none():
++                    # Non-overlap spec never writes the relay; stash the
++                    # tails' pending tokens for the mixed input resolve.
++                    last_tokens = torch.tensor(
++                        [r.output_ids[-1] for r in running_batch.reqs],
++                        dtype=torch.int64,
++                        device=self.device,
++                    )
++                    self.future_map.stash_bonus_tokens(
++                        running_batch.req_pool_indices, last_tokens
++                    )
++                # The mixed batch now owns the tails; they re-enter via the
++                # last_batch extend-merge next iteration.
++                running_batch = ScheduleBatch(
++                    reqs=[], batch_is_full=running_batch.batch_is_full
++                )
+         else:
+             new_batch.decoding_reqs = None
+ 
+diff --git a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
+index d1fba515d9..7d6810b02f 100644
+--- a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
++++ b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
+@@ -328,6 +328,15 @@ class SchedulerBatchResultProcessor:
+                         self._maybe_update_reasoning_tokens(req, next_token_id)
+ 
+                         req.update_finish_state()
++                    # A mixed spec tail committed its pending bonus token; advance
++                    # so the next spec prepare_for_decode reserves from the right base.
++                    if (
++                        not req.finished()
++                        and batch.decoding_reqs
++                        and req in batch.decoding_reqs
++                        and not batch.spec_algorithm.is_none()
++                    ):
++                        req.kv_committed_len += 1
+                     if req.finished():
+                         self._maybe_collect_routed_experts(req)
+                         self._maybe_collect_indexer_topk(req)
+diff --git a/python/sglang/srt/speculative/dflash_worker_v2.py b/python/sglang/srt/speculative/dflash_worker_v2.py
+index 6e27dea786..5e5bfafb0f 100644
+--- a/python/sglang/srt/speculative/dflash_worker_v2.py
++++ b/python/sglang/srt/speculative/dflash_worker_v2.py
+@@ -1925,7 +1925,9 @@ class DFlashWorkerV2(BaseSpecWorker):
+                 batch_output.next_token_ids,
+             )
+             self._tp_sync.sync(SpecTpSyncSite.DFLASH_TARGET, next_token_ids)
+-            batch_output.new_seq_lens = batch.seq_lens
++            # Mixed decode tails already carry the +1 from mix_with_running.
++            new_seq_lens = batch.seq_lens
++            batch_output.new_seq_lens = new_seq_lens
+             if on_publish is not None:
+                 on_publish(batch_output.new_seq_lens)
+ 
+@@ -1970,7 +1972,7 @@ class DFlashWorkerV2(BaseSpecWorker):
+ 
+             batch_output.next_draft_input = self._make_next_draft_input_prefill(
+                 bonus_tokens=next_token_ids,
+-                seq_lens=batch.seq_lens,
++                seq_lens=new_seq_lens,
+             )
+             return batch_output
+ 
+diff --git a/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py b/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
+index 5a26ecf254..246af320dd 100644
+--- a/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
++++ b/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
+@@ -491,7 +491,9 @@ class DSparkWorkerV2(BaseSpecWorker):
+         logits_output = batch_output.logits_output
+         next_token_ids = batch_output.next_token_ids
+         self._tp_sync.sync(SpecTpSyncSite.DSPARK_TARGET, next_token_ids)
+-        batch_output.new_seq_lens = batch.seq_lens
++        # Mixed decode tails already carry the +1 from mix_with_running.
++        new_seq_lens = batch.seq_lens
++        batch_output.new_seq_lens = new_seq_lens
+         if on_publish is not None:
+             on_publish(batch_output.new_seq_lens)
+ 
+@@ -548,7 +550,7 @@ class DSparkWorkerV2(BaseSpecWorker):
+ 
+         batch_output.next_draft_input = make_next_draft_input(
+             bonus_tokens=next_token_ids,
+-            new_seq_lens=batch.seq_lens,
++            new_seq_lens=new_seq_lens,
+         )
+         return batch_output
+ 
+diff --git a/python/sglang/srt/speculative/eagle_worker_v2.py b/python/sglang/srt/speculative/eagle_worker_v2.py
+index afdd57ac7b..ca2c7f52a4 100644
+--- a/python/sglang/srt/speculative/eagle_worker_v2.py
++++ b/python/sglang/srt/speculative/eagle_worker_v2.py
+@@ -1182,6 +1182,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
+ 
+             # Spec_v2 convention: batch.seq_lens = length BEFORE this iter's tokens.
+             # Extend processed L prompt tokens; next verify iter expects same L.
++            # Mixed decode tails already carry the +1 from mix_with_running.
+             batch_output.new_seq_lens = batch.seq_lens
+             # Publish before draft_extend so the fence is at target-end.
+             if on_publish is not None:
+diff --git a/python/sglang/srt/speculative/spec_info.py b/python/sglang/srt/speculative/spec_info.py
+index c2c494ed82..01c318d0ac 100644
+--- a/python/sglang/srt/speculative/spec_info.py
++++ b/python/sglang/srt/speculative/spec_info.py
+@@ -129,6 +129,19 @@ class SpeculativeAlgorithm(Enum):
+     def supports_target_verify_for_draft(self) -> bool:
+         return self.is_dflash_family()
+ 
++    def supports_mixed_chunk(self) -> bool:
++        """Whether mixed chunk prefill may stay enabled with this algorithm.
++
++        ngram cannot join as is: its overlap relay skips output_tokens_buf,
++        which the mixed input resolve reads.
++        """
++        return self in (
++            SpeculativeAlgorithm.EAGLE,
++            SpeculativeAlgorithm.EAGLE3,
++            SpeculativeAlgorithm.DFLASH,
++            SpeculativeAlgorithm.DSPARK,
++        )
++
+     def supports_ragged_verify(self) -> bool:
+         """Whether this algorithm's verify step may carry a RaggedVerifyLayout
+         (per-request verify lengths); gates the token-bucket-keyed verify
+diff --git a/python/sglang/srt/speculative/spec_registry.py b/python/sglang/srt/speculative/spec_registry.py
+index 20c0902bf8..fadca0334e 100644
+--- a/python/sglang/srt/speculative/spec_registry.py
++++ b/python/sglang/srt/speculative/spec_registry.py
+@@ -70,6 +70,9 @@ class CustomSpecAlgo:
+     def is_eagle(self) -> bool:
+         return False
+ 
++    def supports_mixed_chunk(self) -> bool:
++        return False
++
+     def is_eagle3(self) -> bool:
+         return False
+ 
+diff --git a/test/registered/spec/test_spec_mixed_chunk.py b/test/registered/spec/test_spec_mixed_chunk.py
+new file mode 100644
+index 0000000000..8fe1d85acf
+--- /dev/null
++++ b/test/registered/spec/test_spec_mixed_chunk.py
+@@ -0,0 +1,139 @@
++"""Mixed chunk prefill x speculative decoding, overlap scheduler.
++
++One cell per supported algorithm (EAGLE3, DFLASH, DSPARK). Inside a mixed
++step every running request degrades to a 1-token extend of its pending
++bonus token and drafting resumes the next decode step; under overlap the
++tail state is late-bound at forward entry. Regression guards for the
++bring-up failure modes: tail rows dropped from attention metadata (the
++spec seq_lens convention zeroed the tail's qo len - a hard crash on
++flashinfer, silent kv-span truncation elsewhere), unwritten relay rows
++read as tail inputs, and stale schedule-time tail state under overlap.
++Chunked prefill is set small so eval prompts span multiple chunks and
++mixing actually engages.
++"""
++
++import unittest
++
++from sglang.srt.environ import envs
++from sglang.srt.utils import is_sm100_supported, kill_process_tree
++from sglang.test.ci.ci_register import register_cuda_ci
++from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
++from sglang.test.kits.spec_server_kits import (
++    SpecAccuracyKit,
++    SpecCorrectnessKit,
++)
++from sglang.test.server_fixtures.spec_eagle_fixture import Eagle3Base
++from sglang.test.test_utils import (
++    DEFAULT_DRAFT_MODEL_DFLASH,
++    DEFAULT_TARGET_MODEL_DFLASH,
++    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
++    DEFAULT_URL_FOR_TEST,
++    CustomTestCase,
++    popen_launch_server,
++)
++
++register_cuda_ci(est_time=800, stage="base-b", runner_config="1-gpu-large")
++
++
++class TestEagle3MixedChunk(
++    Eagle3Base,
++    SpecCorrectnessKit,
++    SpecAccuracyKit,
++):
++    disable_overlap = False
++    # Small chunks so eval prompts span several of them and mixing engages
++    # (the Eagle3Base preset raises the fixture default to 1024).
++    chunked_prefill_size = 128
++    extra_args = ("--enable-mixed-chunk",)
++
++
++class TestDFlashMixedChunk(GSM8KMixin, CustomTestCase):
++    model = DEFAULT_TARGET_MODEL_DFLASH
++
++    gsm8k_num_questions = 200
++    # Observed 0.755-0.78 across local runs; accept length is the tighter guard.
++    gsm8k_accuracy_thres = 0.70
++    gsm8k_accept_length_thres = 2.8
++
++    process = None
++
++    @classmethod
++    def setUpClass(cls):
++        cls.base_url = DEFAULT_URL_FOR_TEST
++        # The dflash draft config derives a shorter context than the target.
++        with envs.SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN.override(True):
++            cls.process = popen_launch_server(
++                cls.model,
++                cls.base_url,
++                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
++                other_args=[
++                    "--trust-remote-code",
++                    "--speculative-algorithm",
++                    "DFLASH",
++                    "--speculative-draft-model-path",
++                    DEFAULT_DRAFT_MODEL_DFLASH,
++                    "--enable-mixed-chunk",
++                    "--chunked-prefill-size",
++                    "128",
++                    "--mem-fraction-static",
++                    "0.7",
++                ],
++            )
++
++    @classmethod
++    def tearDownClass(cls):
++        if cls.process is not None:
++            kill_process_tree(cls.process.pid)
++
++
++DSPARK_TARGET_MODEL = "Qwen/Qwen3-14B"
++DSPARK_DRAFT_MODEL = "deepseek-ai/dspark_qwen3_14b_block7"
++
++
++class TestDSparkMixedChunk(GSM8KMixin, CustomTestCase):
++    model = DSPARK_TARGET_MODEL
++
++    gsm8k_num_questions = 200
++    gsm8k_accuracy_thres = 0.80
++    gsm8k_accept_length_thres = 2.0
++
++    process = None
++
++    @classmethod
++    def setUpClass(cls):
++        cls.base_url = DEFAULT_URL_FOR_TEST
++        cls.process = popen_launch_server(
++            cls.model,
++            cls.base_url,
++            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
++            other_args=[
++                "--trust-remote-code",
++                "--attention-backend",
++                "trtllm_mha" if is_sm100_supported() else "fa3",
++                "--speculative-draft-attention-backend",
++                "fa4" if is_sm100_supported() else "fa3",
++                "--speculative-algorithm",
++                "DSPARK",
++                "--speculative-draft-model-path",
++                DSPARK_DRAFT_MODEL,
++                "--enable-mixed-chunk",
++                "--chunked-prefill-size",
++                "128",
++                "--cuda-graph-max-bs-decode",
++                "4",
++                "--mem-fraction-static",
++                "0.7",
++                "--page-size",
++                "1",
++                "--disable-piecewise-cuda-graph",
++            ],
++        )
++
++    @classmethod
++    def tearDownClass(cls):
++        if cls.process is not None:
++            kill_process_tree(cls.process.pid)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/test/registered/unit/managers/test_schedule_batch_out_of_place.py b/test/registered/unit/managers/test_schedule_batch_out_of_place.py
+index 572648e79e..4fc0c562ed 100644
+--- a/test/registered/unit/managers/test_schedule_batch_out_of_place.py
++++ b/test/registered/unit/managers/test_schedule_batch_out_of_place.py
+@@ -13,6 +13,7 @@ maybe_stub_sgl_kernel()
+ 
+ from sglang.srt.managers.schedule_batch import ScheduleBatch  # noqa: E402
+ from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
++from sglang.srt.speculative.spec_info import SpeculativeAlgorithm  # noqa: E402
+ from sglang.srt.utils.common import Range  # noqa: E402
+ 
+ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+@@ -22,6 +23,8 @@ AUTO_FILL_EXCLUDED_FIELDS = ["reqs"]
+ 
+ def make_schedule_batch(bs: int, **overrides) -> ScheduleBatch:
+     batch = ScheduleBatch(reqs=overrides.pop("reqs"))
++    # init_new always sets a SpeculativeAlgorithm enum, never None.
++    batch.spec_algorithm = SpeculativeAlgorithm.NONE
+     for field in dataclasses.fields(ScheduleBatch):
+         name = field.name
+         if name in overrides or name in AUTO_FILL_EXCLUDED_FIELDS:
+@@ -70,6 +73,10 @@ class _FakeReq:
+     def _refresh_fill_ids(self):
+         self.full_untruncated_fill_ids = self.origin_input_ids + self.output_ids
+ 
++    @property
++    def seqlen(self):
++        return len(self.origin_input_ids) + len(self.output_ids)
++
+     def set_extend_range(self, start, end):
+         self.extend_range = Range(start, end)
+ 
+diff --git a/test/registered/unit/spec/test_decode_bookkeeping_ownership.py b/test/registered/unit/spec/test_decode_bookkeeping_ownership.py
+index 58840ffd44..01d687cca9 100644
+--- a/test/registered/unit/spec/test_decode_bookkeeping_ownership.py
++++ b/test/registered/unit/spec/test_decode_bookkeeping_ownership.py
+@@ -78,6 +78,13 @@ _OWNER_SITES = {
+     ): 1,
+     (*_RESOLVE, "kv_committed_len"): 1,
+     (*_RESOLVE, "spec_verify_ct"): 1,
++    # Mixed-chunk spec tails: the mixed prefill step commits the pending
++    # bonus token, advancing the watermark by exactly that one token.
++    (
++        "managers/scheduler_components/batch_result_processor.py",
++        "SchedulerBatchResultProcessor.process_batch_result_prefill",
++        "kv_committed_len",
++    ): 1,
+     # disaggregation decode prealloc: kv_allocated_len is settled inside the
+     # owned-kv alloc_for_decode_prealloc(_hisparse) functions (op42).
+     (
+-- 
+2.34.1
+

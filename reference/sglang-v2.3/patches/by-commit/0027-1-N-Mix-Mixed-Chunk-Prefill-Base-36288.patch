@@ -1,0 +1,411 @@
+From 66b7ff6e41f4b7fc676826074b42018c68f981ff Mon Sep 17 00:00:00 2001
+From: Yuwei An <ayw.sirius19@gmail.com>
+Date: Thu, 27 Aug 2026 12:59:56 -0700
+Subject: [PATCH 27/38] [1/N][Mix] Mixed Chunk Prefill Base (#36288)
+
+Co-authored-by: Claude Fable 5 <noreply@anthropic.com>
+---
+ python/sglang/srt/managers/schedule_batch.py  |  30 ++++
+ python/sglang/srt/managers/scheduler.py       |   9 +
+ .../batch_result_processor.py                 |  15 +-
+ .../managers/scheduler_components/dp_attn.py  | 166 +++++++++++++++---
+ .../srt/model_executor/runner/__init__.py     |   3 +-
+ .../srt/model_executor/runner/eager_runner.py |  15 +-
+ .../runner/prefill_cuda_graph_runner.py       |   9 +-
+ 7 files changed, 208 insertions(+), 39 deletions(-)
+
+diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
+index 3ff2a29f3f..1e1dec5aaa 100755
+--- a/python/sglang/srt/managers/schedule_batch.py
++++ b/python/sglang/srt/managers/schedule_batch.py
+@@ -2779,6 +2779,36 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+         )
+         self.is_prefill_only = False
+ 
++    def convert_decode_to_extend(self):
++        """View every decode request as a 1-token extend with its context as
++        prefix, making this a plain extend (prefill) batch. Called after the
++        DP mlp-sync when a peer rank runs extend, so this rank replays the
++        extend graphs; requires prepare_for_decode(); token count unchanged.
++        """
++        bs = self.batch_size()
++        self.forward_mode = ForwardMode.EXTEND
++        # Stale residue from this object's life as a prefill batch; the
++        # extend-merge path would exclude (silently drop) that req otherwise.
++        self.chunked_req = None
++        # Also stale residue; None keeps the prefill result path from
++        # re-reporting old prefill stats for what is decode work.
++        self.prefill_stats = None
++        for req in self.reqs:
++            req._refresh_fill_ids()
++            full_len = len(req.full_untruncated_fill_ids)
++            req.set_extend_range(full_len - 1, full_len)
++
++        # Same one-step output_ids delay handling as mix_with_running.
++        delta = 0 if self.enable_overlap else -1
++        self.prefix_lens = [
++            len(r.origin_input_ids) + len(r.output_ids) + delta for r in self.reqs
++        ]
++        self.extend_lens = [1] * bs
++        self.extend_num_tokens = bs
++        self.extend_logprob_start_lens = [0] * bs
++        self.decoding_reqs = self.reqs
++        self.is_prefill_only = False
++
+     def new_tokens_required_next_decode(
+         self, selected_indices: Optional[List[int]] = None
+     ):
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index 693664760d..5ecf6c91f0 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -3174,6 +3174,15 @@ class Scheduler(
+         ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(
+             ret, need_sync=need_mlp_sync
+         )
++        # Decode->extend conversion keeps a heterogeneous dp step replayable.
++        converted = self.dp_attn_adapter.maybe_convert_decode_to_extend(ret)
++        if converted is running_batch and converted.forward_mode.is_extend():
++            # The converted batch re-enters via the last_batch extend-merge
++            # next iteration; empty running_batch or it merges with itself.
++            running_batch = ScheduleBatch(
++                reqs=[], batch_is_full=running_batch.batch_is_full
++            )
++        ret = converted
+ 
+         # Handle ngram embedding
+         ret = self.ngram_embedding_manager.prepare_for_forward(
+diff --git a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
+index 024781c37e..c7df882db2 100644
+--- a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
++++ b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
+@@ -368,12 +368,15 @@ class SchedulerBatchResultProcessor:
+         )
+ 
+         can_run_cuda_graph = result.can_run_cuda_graph
+-        self.metrics_reporter.report_prefill_stats(
+-            batch=batch,
+-            prefill_stats=batch.prefill_stats,
+-            can_run_cuda_graph=can_run_cuda_graph,
+-            dp_cooperation_info=batch.dp_cooperation_info,
+-        )
++        # None on decode->extend converted batches; they are decode work and
++        # have no prefill stats to report.
++        if batch.prefill_stats is not None:
++            self.metrics_reporter.report_prefill_stats(
++                batch=batch,
++                prefill_stats=batch.prefill_stats,
++                can_run_cuda_graph=can_run_cuda_graph,
++                dp_cooperation_info=batch.dp_cooperation_info,
++            )
+ 
+     def _convert_embeddings(self, *, result: EmbeddingBatchResult) -> list:
+         is_sparse = envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set()
+diff --git a/python/sglang/srt/managers/scheduler_components/dp_attn.py b/python/sglang/srt/managers/scheduler_components/dp_attn.py
+index 56274517e0..e4d7499afc 100644
+--- a/python/sglang/srt/managers/scheduler_components/dp_attn.py
++++ b/python/sglang/srt/managers/scheduler_components/dp_attn.py
+@@ -10,13 +10,16 @@ from sglang.srt.configs.model_config import ModelConfig
+ from sglang.srt.distributed.parallel_state import get_tp_group
+ from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+ from sglang.srt.environ import envs
++from sglang.srt.layers.cp.utils import get_cp_strategy
+ from sglang.srt.layers.dp_attention import world_dp_gather_enabled
++from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+ from sglang.srt.managers.schedule_batch import ScheduleBatch
+ from sglang.srt.managers.scheduler_components.recv_skipper import (
+     SchedulerRecvSkipper,
+ )
+ from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+ from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
++from sglang.srt.mem_cache.kv_cache_builder import uses_ssm_state
+ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+ from sglang.srt.model_executor.cuda_graph_config import (
+     Backend,
+@@ -25,8 +28,14 @@ from sglang.srt.model_executor.cuda_graph_config import (
+     cuda_graph_fully_disabled,
+ )
+ from sglang.srt.model_executor.forward_batch_info import ForwardMode
++from sglang.srt.model_executor.runner import PrefillCudaGraphRunner
+ from sglang.srt.observability.metrics_collector import DPCooperationInfo
+-from sglang.srt.runtime_context import get_parallel, get_schedule
++from sglang.srt.runtime_context import (
++    get_exec,
++    get_memory,
++    get_parallel,
++    get_schedule,
++)
+ from sglang.srt.server_args import ServerArgs
+ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+ from sglang.srt.utils.common import require_mlp_tp_gather
+@@ -225,6 +234,91 @@ def _update_gather_batch(
+     batch.can_run_dp_breakable_cuda_graph = mlp_sync_info.can_run_prefill_cuda_graph
+ 
+ 
++def _local_decode_cuda_graph_vote(
++    *,
++    local_batch: Optional[ScheduleBatch],
++    disable_cuda_graph: bool,
++) -> bool:
++    """This rank's vote for the decode graph (min-reduced across dp ranks)."""
++    if disable_cuda_graph:
++        return False
++    return (
++        local_batch is None
++        or local_batch.forward_mode.is_decode_or_idle()
++        or local_batch.forward_mode.is_prebuilt()
++    )
++
++
++def _local_prefill_cuda_graph_vote(
++    *,
++    local_batch: Optional[ScheduleBatch],
++    prefill_graph_runner,
++    coordinated_prefill: bool,
++    breakable_prefill: bool,
++    spec_algorithm: SpeculativeAlgorithm,
++    model_config,
++) -> bool:
++    """This rank's vote for the prefill graph (min-reduced across dp
++    ranks). Extend/mixed batches vote their own replayability; a decode
++    batch eligible for the decode->extend conversion votes as its 1-token-
++    extend view, so the vote and the post-sync conversion always agree."""
++    if local_batch is None or local_batch.forward_mode.is_idle():
++        return True
++    if not coordinated_prefill:
++        return False
++
++    mode = local_batch.forward_mode
++    if mode in (ForwardMode.EXTEND, ForwardMode.MIXED):
++        num_tokens = local_batch.extend_num_tokens
++        input_embeds = local_batch.input_embeds
++        replace_embeds = local_batch.replace_embeds
++        prefix_lens = local_batch.prefix_lens
++        return_logprob = local_batch.return_logprob
++    elif (
++        mode.is_decode()
++        # Conversion replays the breakable graphs only; full's fixed
++        # request-slot geometry does not cover converted decode tails.
++        and breakable_prefill
++        # decode->extend conversion eligibility; needs the captured-graph
++        # prefill runner, not the eager fallback.
++        and isinstance(prefill_graph_runner, PrefillCudaGraphRunner)
++        and spec_algorithm.is_none()
++        and not local_batch.return_logprob
++        # Grammar FSMs advance through the decode result path only.
++        and not local_batch.has_grammar
++        # Small-bucket BCG replays amplify the a2a EP logits drift (#30898)
++        # into an accuracy loss.
++        and get_moe_a2a_backend().is_none()
++        # The converted view lacks prepare_for_extend's mamba-track fills.
++        and not uses_ssm_state(model_config)
++        # HiSparse decode has its own batch lifecycle and host-offloaded KV.
++        and not get_memory().enable_hisparse
++        and not get_exec().overlap.enable_two_batch_overlap
++        and get_cp_strategy() is None
++    ):
++        num_tokens = local_batch.batch_size()
++        input_embeds = None
++        replace_embeds = None
++        prefix_lens = None
++        return_logprob = False
++    else:
++        return False
++
++    if prefill_graph_runner is None:
++        return True
++    return prefill_graph_runner.can_replay_locally(
++        batch_size=local_batch.batch_size(),
++        num_tokens=num_tokens,
++        input_embeds=input_embeds,
++        replace_embeds=replace_embeds,
++        prefix_lens=prefix_lens,
++        is_target_verify=mode.is_target_verify(),
++        capture_hidden_mode=None,
++        return_logprob=return_logprob,
++        lora_ineligible=prefill_graph_runner.enable_lora,
++    )
++
++
+ def prepare_mlp_sync_batch_raw(
+     local_batch: ScheduleBatch,
+     model_runner: ModelRunner,
+@@ -266,37 +360,23 @@ def prepare_mlp_sync_batch_raw(
+         )
+ 
+     skip_all_gather = envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get()
+-    can_run_decode_cuda_graph = (
+-        local_batch is None
+-        or local_batch.forward_mode.is_decode_or_idle()
+-        or local_batch.forward_mode.is_prebuilt()
+-    ) and not disable_cuda_graph
++    can_run_decode_cuda_graph = _local_decode_cuda_graph_vote(
++        local_batch=local_batch, disable_cuda_graph=disable_cuda_graph
++    )
+     breakable_prefill = check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)
++    coordinated_prefill = breakable_prefill or check_cuda_graph_backend(
++        Phase.PREFILL, Backend.FULL
++    )
+     prefill_graph_runner = (
+         model_runner.prefill_cuda_graph_runner if breakable_prefill else None
+     )
+-    can_run_prefill_cuda_graph = (
+-        local_batch is None
+-        or local_batch.forward_mode.is_idle()
+-        # Breakable Cuda Graph Backend Check.
+-        or (
+-            local_batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
+-            and (
+-                prefill_graph_runner is None
+-                or prefill_graph_runner.can_replay_locally(
+-                    batch_size=local_batch.batch_size(),
+-                    num_tokens=local_batch.extend_num_tokens,
+-                    input_embeds=local_batch.input_embeds,
+-                    replace_embeds=None,
+-                    prefix_lens=local_batch.prefix_lens,
+-                    is_target_verify=local_batch.forward_mode.is_target_verify(),
+-                    capture_hidden_mode=None,
+-                    return_logprob=local_batch.return_logprob,
+-                    lora_ineligible=prefill_graph_runner.enable_lora,
+-                )
+-            )
+-            and breakable_prefill
+-        )
++    can_run_prefill_cuda_graph = _local_prefill_cuda_graph_vote(
++        local_batch=local_batch,
++        prefill_graph_runner=prefill_graph_runner,
++        coordinated_prefill=coordinated_prefill,
++        breakable_prefill=breakable_prefill,
++        spec_algorithm=model_runner.spec_algorithm,
++        model_config=model_runner.model_config,
+     )
+ 
+     is_extend_in_batch = local_batch.forward_mode.is_extend() if local_batch else False
+@@ -439,6 +519,36 @@ class SchedulerDPAttnAdapter:
+             batch = self.prepare_mlp_sync_batch(batch)
+         return batch
+ 
++    def maybe_convert_decode_to_extend(
++        self, batch: Optional[ScheduleBatch]
++    ) -> Optional[ScheduleBatch]:
++        """After the mlp-sync gather: convert an eligible decode batch to the
++        extend view when a peer rank runs extend this step, so the step stays
++        mode-homogeneous and every rank replays the extend graphs instead of
++        all falling to eager."""
++        if batch is None or not batch.forward_mode.is_decode():
++            return batch
++        # Global triggers from the gather. This rank's own eligibility (spec/
++        # TBO/CP/logprob/replayability) is folded into the min-reduced vote:
++        # if it failed, can_run_dp_prefill_cuda_graph is already False.
++        if not batch.is_extend_in_batch:
++            return batch
++        if not batch.can_run_dp_prefill_cuda_graph:
++            # The step is eager everywhere; eager decode beats eager mixed.
++            return batch
++        global_tokens = batch.global_num_tokens
++        if (
++            global_tokens is not None
++            and len(global_tokens) > 1
++            and min(global_tokens) == 0
++        ):
++            # An idle rank makes the prefill runner reject replay for every
++            # rank (_has_inactive_dp_rank); converting would only trade eager
++            # decode for eager mixed.
++            return batch
++        batch.convert_decode_to_extend()
++        return batch
++
+     def get_idle_batch(self) -> ScheduleBatch:
+         idle_batch = ScheduleBatch.init_new(
+             [],
+diff --git a/python/sglang/srt/model_executor/runner/__init__.py b/python/sglang/srt/model_executor/runner/__init__.py
+index fd03b27529..9aa65fbf57 100644
+--- a/python/sglang/srt/model_executor/runner/__init__.py
++++ b/python/sglang/srt/model_executor/runner/__init__.py
+@@ -12,7 +12,8 @@ Public API:
+   - BaseCudaGraphRunner — abstract cuda-graph base; bucket padding +
+     capture-loop scaffolding on top of BaseRunner.
+   - DecodeCudaGraphRunner — concrete decode-phase runner.
+-  - PrefillCudaGraphRunner — concrete prefill-phase runner.
++  - PrefillCudaGraphRunner — concrete prefill-phase runner (extend family;
++    MIXED batches replay the EXTEND-captured graphs).
+   - EagerRunner — no-cuda-graph runner; runs model.forward live (the
+     eager dual of the cuda-graph runners), mode-dispatched over decode +
+     extend + idle.
+diff --git a/python/sglang/srt/model_executor/runner/eager_runner.py b/python/sglang/srt/model_executor/runner/eager_runner.py
+index cf6d3703c3..ad3182e326 100644
+--- a/python/sglang/srt/model_executor/runner/eager_runner.py
++++ b/python/sglang/srt/model_executor/runner/eager_runner.py
+@@ -27,6 +27,7 @@ from sglang.srt.environ import envs
+ from sglang.srt.layers.cp.utils import (
+     cp_gather_after_forward,
+     cp_shard_model_inputs,
++    get_cp_strategy,
+     is_cp_v2_active,
+     prepare_cp_forward,
+ )
+@@ -37,7 +38,11 @@ from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+ from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
+     create_chunked_prefix_cache_kv_indices,
+ )
+-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
++from sglang.srt.model_executor.forward_batch_info import (
++    ForwardBatch,
++    ForwardMode,
++    PPProxyTensors,
++)
+ from sglang.srt.model_executor.forward_context import (
+     ForwardContext,
+     forward_context,
+@@ -56,7 +61,7 @@ from sglang.srt.runtime_context import (
+     max_prefill_buffer_tokens,
+     max_speculative_num_draft_tokens,
+ )
+-from sglang.srt.utils import is_hip
++from sglang.srt.utils import is_hip, is_npu
+ from sglang.srt.utils.common import (
+     ceil_align,
+     get_eager_max_batch_size,
+@@ -205,6 +210,12 @@ class EagerRunner(BaseRunner):
+         self, forward_batch: ForwardBatch, pp_proxy_tensors=None, **kwargs
+     ) -> Any:
+         mode = forward_batch.forward_mode
++        if mode.is_mixed() and not is_npu() and get_cp_strategy() is None:
++            # A mixed batch is extend-shaped (decode tails are 1-token
++            # extends); run it as EXTEND. NPU keeps MIXED for its dedicated
++            # kernel; CP keeps it to skip the zigzag split.
++            forward_batch.forward_mode = ForwardMode.EXTEND
++            mode = ForwardMode.EXTEND
+         if mode.is_decode():
+             return self._execute_decode(forward_batch, pp_proxy_tensors)
+         if mode.is_idle():
+diff --git a/python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py b/python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py
+index a97adb875d..731dc6a4ef 100644
+--- a/python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py
++++ b/python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py
+@@ -252,6 +252,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
+     """
+ 
+     def __init__(self, model_runner: ModelRunner):
++        if get_schedule().enable_mixed_chunk:
++            backend = get_exec().graph.cuda_graph_config.prefill.backend
++            assert backend == Backend.BREAKABLE, (
++                "Mixed chunk prefill requires the breakable prefill CUDA "
++                f"graph backend; got '{backend}'."
++            )
+         super().__init__(model_runner)
+         # --- model flags ----------------------------------------------
+         self.quant_config = getattr(model_runner.model, "quant_config", None)
+@@ -1504,8 +1510,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
+             else forward_batch.num_token_non_padded
+         )
+ 
+-        # Normalize MIXED→EXTEND so dynamo's guard (captured with EXTEND=1)
+-        # doesn't fail on MIXED=3.
++        # MIXED replays the EXTEND-captured graphs.
+         pcg_forward_mode = (
+             ForwardMode.EXTEND
+             if forward_batch.forward_mode == ForwardMode.MIXED
+-- 
+2.34.1
+

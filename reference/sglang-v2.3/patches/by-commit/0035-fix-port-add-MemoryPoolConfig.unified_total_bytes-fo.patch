@@ -1,0 +1,29 @@
+From 04469214e6aeb76a2993b570768dfe000a2c9768 Mon Sep 17 00:00:00 2001
+From: root <root@MyComputer.localdomain>
+Date: Sun, 6 Sep 2026 20:55:56 +0800
+Subject: [PATCH 35/38] fix(port): add MemoryPoolConfig.unified_total_bytes for
+ #35544 configurator
+
+Upstream #35544 kv_cache_configurator threads a unified-memory byte budget through MemoryPoolConfig; our stack does not use the unified pool, so default None keeps the default sizing branch.
+---
+ python/sglang/srt/model_executor/pool_configurator.py | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/python/sglang/srt/model_executor/pool_configurator.py b/python/sglang/srt/model_executor/pool_configurator.py
+index 4f6dc72ae9..551c49c019 100644
+--- a/python/sglang/srt/model_executor/pool_configurator.py
++++ b/python/sglang/srt/model_executor/pool_configurator.py
+@@ -71,6 +71,10 @@ class MemoryPoolConfig:
+ 
+     mem_fraction_static: Optional[float] = None
+ 
++    # Upstream #35544 field: unified-memory pool byte budget. Unused on
++    # this stack (no unified memory pool); None keeps the default branch.
++    unified_total_bytes: Optional[int] = None
++
+     def __post_init__(self):
+         if self.max_total_num_tokens <= 0:
+             msg = "Not enough memory. Please try to increase --mem-fraction-static."
+-- 
+2.34.1
+

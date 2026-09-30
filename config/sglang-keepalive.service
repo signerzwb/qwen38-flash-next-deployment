@@ -1,0 +1,17 @@
+[Unit]
+Description=SSE keep-alive proxy in front of SGLang (8779 -> 8778)
+Documentation=file:///root/sse-keepalive-proxy.py
+After=network.target sglang-qwen38.service
+Wants=sglang-qwen38.service
+
+[Service]
+Type=simple
+# 0.0.0.0 so the Windows portproxy can reach it; upstream stays on loopback.
+ExecStart=/root/sglang-env-v23/bin/python /root/sse-keepalive-proxy.py --host 0.0.0.0 --port 8779 --upstream-host 127.0.0.1 --upstream-port 8778 --idle 10
+Restart=always
+RestartSec=3
+StandardOutput=append:/root/sse-keepalive.log
+StandardError=append:/root/sse-keepalive.log
+
+[Install]
+WantedBy=multi-user.target

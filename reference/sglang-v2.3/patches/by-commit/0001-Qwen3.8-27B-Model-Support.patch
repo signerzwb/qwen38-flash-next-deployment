@@ -1,0 +1,1310 @@
+From 374a6b24f2f2b52fc131417d8d0e4e78900f7a5d Mon Sep 17 00:00:00 2001
+From: yhyang201 <yhyang201@gmail.com>
+Date: Fri, 14 Aug 2026 22:59:30 +0800
+Subject: [PATCH 01/38] Qwen3.8-27B Model Support
+
+Squashed from radixark/sglang-qwen38-27b#1:
+
+- Start Qwen3.8-27B model support
+- Cast cu_seqlens to int64 in the SM120/SM100 GDN prefill path
+- Widen swapAB dispatch range in SM120 fp8 blockwise GEMM
+- Fix DSpark draft logits when the target lm_head is quantized
+- Fuse SiLU+mul with NVFP4 down_proj input quantization for dense MLP
+- Add SM120 M=1 fp8 GEMV fast path for per-tensor ModelOpt FP8 linear
+- GDN: support the non-power-of-two v/k head ratio 3 in the fused contiguous split
+- GDN: default FlashInfer prefill on SM90 and accept bf16 state pools on SM120
+- Add Hopper single-token bf16 GEMV as a bf16-gemm-backend option
+
+Co-authored-by: Jimmy Shong <69131491+Jiminator@users.noreply.github.com>
+Co-authored-by: Brayden Zhong <brayden.zhong@radixark.ai>
+Co-authored-by: BBuf <1182563586@qq.com>
+Co-authored-by: Zijie Xia <zijie.xia@radixark.ai>
+Co-authored-by: Claude Fable 5 <noreply@anthropic.com>
+Co-authored-by: Qiaolin Yu <liin1211@outlook.com>
+---
+ .../fp8_blockwise_scaled_mm_sm120.cuh         |  29 +++-
+ .../jit/csrc/gemm/hopper_bf16_gemv.cuh        | 145 ++++++++++++++++
+ .../kernels/jit/csrc/gemm/sm120_fp8_gemv.cuh  | 156 ++++++++++++++++++
+ .../ops/attention/triton_gdn_fused_proj.py    |  57 +++----
+ .../kernels/ops/gemm/hopper_bf16_gemv.py      |  63 +++++++
+ .../sglang/kernels/ops/gemm/sm120_fp8_gemv.py |  61 +++++++
+ .../layers/attention/linear/gdn_backend.py    |  28 +++-
+ .../linear/kernels/gdn_flashinfer.py          |  11 +-
+ .../srt/layers/quantization/modelopt_quant.py |  40 +++++
+ .../sglang/srt/layers/quantization/unquant.py |  30 +++-
+ .../sglang/srt/models/deepseek_v4_dspark.py   |   5 +-
+ python/sglang/srt/models/dspark.py            |  16 +-
+ python/sglang/srt/models/qwen2_moe.py         |  38 +++++
+ python/sglang/srt/models/qwen3_5.py           |  38 ++++-
+ python/sglang/srt/server_args.py              |   2 +-
+ .../dspark_components/dspark_draft_sampler.py |  13 +-
+ .../test_gdn_fused_split_head_ratios.py       |  91 ++++++++++
+ test/registered/gemm/test_hopper_bf16_gemv.py |  68 ++++++++
+ 18 files changed, 836 insertions(+), 55 deletions(-)
+ create mode 100644 python/sglang/kernels/jit/csrc/gemm/hopper_bf16_gemv.cuh
+ create mode 100644 python/sglang/kernels/jit/csrc/gemm/sm120_fp8_gemv.cuh
+ create mode 100644 python/sglang/kernels/ops/gemm/hopper_bf16_gemv.py
+ create mode 100644 python/sglang/kernels/ops/gemm/sm120_fp8_gemv.py
+ create mode 100644 test/registered/attention/test_gdn_fused_split_head_ratios.py
+ create mode 100644 test/registered/gemm/test_hopper_bf16_gemv.py
+
+diff --git a/python/sglang/kernels/jit/csrc/gemm/fp8_blockwise/fp8_blockwise_scaled_mm_sm120.cuh b/python/sglang/kernels/jit/csrc/gemm/fp8_blockwise/fp8_blockwise_scaled_mm_sm120.cuh
+index 9a63d13308..ab4f9deb1e 100644
+--- a/python/sglang/kernels/jit/csrc/gemm/fp8_blockwise/fp8_blockwise_scaled_mm_sm120.cuh
++++ b/python/sglang/kernels/jit/csrc/gemm/fp8_blockwise/fp8_blockwise_scaled_mm_sm120.cuh
+@@ -280,6 +280,8 @@ void launch_sm120_fp8_blockwise_scaled_mm(
+ }
+ 
+ // Transposed GEMM D^T = Wgemm(weight, activation): puts tokens on the N axis.
++// EpilogueTileShape selects the epilogue subtile; EpilogueTileAuto resolves to
++// (64, min(CTA_N,32)) here -- see sm120_builder.inl.
+ template <
+     typename OutType,
+     typename MmaTileShape,
+@@ -393,7 +395,7 @@ void launch_sm120_fp8_blockwise_scaled_mm_swapab(
+       OperatorClass,
+       PerSmTileShape,
+       ClusterShape,
+-      cutlass::epilogue::collective::EpilogueTileAuto,
++      EpilogueTileShape,
+       ElementAccumulator,
+       ElementAccumulator,
+       ElementC,
+@@ -441,16 +443,37 @@ void sm120_fp8_blockwise_dispatch_shape(
+     cudaStream_t stream) {
+   const int m = a.size(0);
+   using EpilogueTileShape = Shape<_128, _64>;
+-  if (m <= 64 || (m % 4 != 0)) {
++
++  // swapAB keeps the weight on the gemm-M axis and the tokens on gemm-N, so it reads the
++  // weight once per token tile and needs only (128+TileN)*128 bytes of smem per stage.
++  // It stays ahead of the non-swapAB path well past the old m<=64 crossover: autotuned
++  // over 12 tactics x M in {4..1024} x all five Qwen3.x-27B-FP8 TP1 decode shapes
++  // (cold-L2 CUPTI + CUDA graph, one GPU per shape), the old crossover cost 4.5-7.3% of a
++  // full pass for m in [96, 256] -- e.g. out_proj at m=96: 51.74us non-swapAB (StreamK,
++  // 188 CTAs) vs 38.23us swapAB (120 CTAs).
++  if (m <= 128 || (m % 4 != 0)) {
+     launch_sm120_fp8_blockwise_scaled_mm_swapab<
+         OutType,
+         Shape<_128, _32, _128>,
+         Shape<_128, _32, _128>,
+-        EpilogueTileShape,
++        cutlass::epilogue::collective::EpilogueTileAuto,
+         Shape<_1, _32, _1>>(out, a, b, scales_a, scales_b, stream);
+     return;
+   }
+ 
++  // 128 < m <= 256: a 64-wide token tile amortizes the weight read over twice as many
++  // tokens per pass. 3 stages instead of 4 ((128+64)*128 = 24576 B per stage), which the
++  // sweep shows costs nothing.
++  if (m <= 256) {
++    launch_sm120_fp8_blockwise_scaled_mm_swapab<
++        OutType,
++        Shape<_128, _64, _128>,
++        Shape<_128, _64, _128>,
++        Shape<_128, _32>,
++        Shape<_1, _64, _1>>(out, a, b, scales_a, scales_b, stream);
++    return;
++  }
++
+   using MmaTileShape = Shape<_128, _128, _128>;
+   using PerSmTileShape = Shape<_128, _128, _128>;
+   using ScalesPerTile = Shape<_128, _1, _1>;
+diff --git a/python/sglang/kernels/jit/csrc/gemm/hopper_bf16_gemv.cuh b/python/sglang/kernels/jit/csrc/gemm/hopper_bf16_gemv.cuh
+new file mode 100644
+index 0000000000..5efde8ceba
+--- /dev/null
++++ b/python/sglang/kernels/jit/csrc/gemm/hopper_bf16_gemv.cuh
+@@ -0,0 +1,145 @@
++#include <sgl_kernel/tensor.h>
++#include <sgl_kernel/utils.h>
++
++#include <sgl_kernel/type.cuh>
++#include <sgl_kernel/utils.cuh>
++
++#include <tvm/ffi/container/tensor.h>
++
++#include <cstdint>
++
++namespace sglang {
++
++using namespace device;
++
++// Single-token (M=1) bf16 GEMV tuned for Hopper decode: y[N] = W[N,K] @ x[K].
++//
++// Layout: one warp computes kRows consecutive output rows; the activation
++// vector is staged once in static shared memory and reused by every warp;
++// weights are streamed with evict-first loads (read exactly once). All
++// reductions happen in registers + one warp shuffle tree, so there is no
++// split-K fixup kernel. Weight traffic dominates (N*K*2 bytes), so the
++// design goal is simply maximum sustained DRAM read bandwidth.
++
++constexpr uint32_t kGemvVecSize = 16 / sizeof(bf16_t);  // 8 bf16 per 16B load
++
++__device__ __forceinline__ float dot8_f32(const float4 wv, const float4 xv) {
++  const bf16x2_t* w2 = reinterpret_cast<const bf16x2_t*>(&wv);
++  const bf16x2_t* x2 = reinterpret_cast<const bf16x2_t*>(&xv);
++  float acc = 0.0f;
++#pragma unroll
++  for (int i = 0; i < 4; ++i) {
++    const auto [w0, w1] = cast<fp32x2_t>(w2[i]);
++    const auto [x0, x1] = cast<fp32x2_t>(x2[i]);
++    acc = fmaf(w0, x0, acc);
++    acc = fmaf(w1, x1, acc);
++  }
++  return acc;
++}
++
++template <uint32_t N, uint32_t K, uint32_t kRows, uint32_t kUnroll, uint32_t kNumWarps>
++__global__ void __launch_bounds__(kNumWarps * 32)
++    hopper_bf16_gemv_kernel(bf16_t* __restrict__ out, const bf16_t* __restrict__ x, const bf16_t* __restrict__ w) {
++  __shared__ bf16_t sx[K];
++
++  const uint32_t tid = threadIdx.x;
++  for (uint32_t i = tid * kGemvVecSize; i < K; i += kNumWarps * 32 * kGemvVecSize) {
++    *reinterpret_cast<float4*>(sx + i) = *reinterpret_cast<const float4*>(x + i);
++  }
++  __syncthreads();
++
++  const uint32_t warp = tid / 32;
++  const uint32_t lane = tid % 32;
++  const uint32_t r0 = (blockIdx.x * kNumWarps + warp) * kRows;
++  if (r0 >= N) {
++    return;
++  }
++
++  float acc[kRows];
++#pragma unroll
++  for (uint32_t r = 0; r < kRows; ++r) {
++    acc[r] = 0.0f;
++  }
++
++  constexpr uint32_t kStep = 32 * kGemvVecSize * kUnroll;
++  if (r0 + kRows <= N) {
++    for (uint32_t k = lane * kGemvVecSize * kUnroll; k < K; k += kStep) {
++      float4 xv[kUnroll];
++#pragma unroll
++      for (uint32_t u = 0; u < kUnroll; ++u) {
++        xv[u] = *reinterpret_cast<const float4*>(sx + k + u * kGemvVecSize);
++      }
++#pragma unroll
++      for (uint32_t r = 0; r < kRows; ++r) {
++        const bf16_t* wr = w + static_cast<size_t>(r0 + r) * K + k;
++        float4 wv[kUnroll];
++#pragma unroll
++        for (uint32_t u = 0; u < kUnroll; ++u) {
++          wv[u] = __ldcs(reinterpret_cast<const float4*>(wr + u * kGemvVecSize));
++        }
++#pragma unroll
++        for (uint32_t u = 0; u < kUnroll; ++u) {
++          acc[r] += dot8_f32(wv[u], xv[u]);
++        }
++      }
++    }
++  } else {
++    // Tail block: guard each row (only reached when N % (kRows*kNumWarps) != 0).
++    for (uint32_t k = lane * kGemvVecSize * kUnroll; k < K; k += kStep) {
++#pragma unroll
++      for (uint32_t r = 0; r < kRows; ++r) {
++        if (r0 + r < N) {
++          const bf16_t* wr = w + static_cast<size_t>(r0 + r) * K + k;
++#pragma unroll
++          for (uint32_t u = 0; u < kUnroll; ++u) {
++            float4 wv = __ldcs(reinterpret_cast<const float4*>(wr + u * kGemvVecSize));
++            float4 xv = *reinterpret_cast<const float4*>(sx + k + u * kGemvVecSize);
++            acc[r] += dot8_f32(wv, xv);
++          }
++        }
++      }
++    }
++  }
++
++#pragma unroll
++  for (uint32_t r = 0; r < kRows; ++r) {
++#pragma unroll
++    for (uint32_t off = 16; off > 0; off >>= 1) {
++      acc[r] += __shfl_down_sync(0xffffffff, acc[r], off);
++    }
++  }
++  if (lane == 0) {
++#pragma unroll
++    for (uint32_t r = 0; r < kRows; ++r) {
++      if (r0 + r < N) {
++        out[r0 + r] = cast<bf16_t>(acc[r]);
++      }
++    }
++  }
++}
++
++template <uint32_t N, uint32_t K, uint32_t kRows, uint32_t kUnroll, uint32_t kNumWarps>
++struct HopperBf16GemvKernel {
++  static_assert(K % (32 * kGemvVecSize * kUnroll) == 0, "K must cover full unrolled warp strides");
++  static_assert(K * sizeof(bf16_t) <= 48 * 1024, "activation row must fit static shared memory");
++
++  static void run(const tvm::ffi::TensorView x, const tvm::ffi::TensorView w, const tvm::ffi::TensorView out) {
++    using namespace host;
++
++    auto device = SymbolicDevice{};
++    device.set_options<kDLCUDA>();
++    TensorMatcher({1, K}).with_dtype<bf16_t>().with_device(device).verify(x);
++    TensorMatcher({N, K}).with_dtype<bf16_t>().with_device(device).verify(w);
++    TensorMatcher({1, N}).with_dtype<bf16_t>().with_device(device).verify(out);
++
++    constexpr uint32_t kRowsPerBlock = kRows * kNumWarps;
++    constexpr uint32_t kNumBlocks = (N + kRowsPerBlock - 1) / kRowsPerBlock;
++    LaunchKernel(kNumBlocks, kNumWarps * 32, device.unwrap())(
++        hopper_bf16_gemv_kernel<N, K, kRows, kUnroll, kNumWarps>,
++        static_cast<bf16_t*>(out.data_ptr()),
++        static_cast<const bf16_t*>(x.data_ptr()),
++        static_cast<const bf16_t*>(w.data_ptr()));
++  }
++};
++
++}  // namespace sglang
+diff --git a/python/sglang/kernels/jit/csrc/gemm/sm120_fp8_gemv.cuh b/python/sglang/kernels/jit/csrc/gemm/sm120_fp8_gemv.cuh
+new file mode 100644
+index 0000000000..4947d62263
+--- /dev/null
++++ b/python/sglang/kernels/jit/csrc/gemm/sm120_fp8_gemv.cuh
+@@ -0,0 +1,156 @@
++#include <sgl_kernel/tensor.h>
++#include <sgl_kernel/utils.h>
++
++#include <sgl_kernel/type.cuh>
++#include <sgl_kernel/utils.cuh>
++
++#include <tvm/ffi/container/tensor.h>
++
++#include <cstdint>
++#include <cuda_fp8.h>
++
++namespace sglang {
++
++using namespace device;
++
++// Single-token (M=1) per-tensor-scale FP8 GEMV for SM120 decode:
++//   y[N] = (W_fp8[N,K] @ x_fp8[K]) * alpha,  alpha = scale_a * scale_b.
++//
++// cuBLAS serves these shapes with SM89 tiles and leaves 30-50% DRAM
++// bandwidth on the table for mid-sized N (wave-quantization floor around
++// 19us). Same design as the Hopper bf16 GEMV: one warp computes kRows
++// consecutive rows, the fp8 activation vector is staged in shared memory,
++// weights stream once with evict-first loads, and the reduction is a
++// register + warp-shuffle tree.
++
++constexpr uint32_t kFp8VecSize = 16;  // 16 fp8 values per 16B load
++
++__device__ __forceinline__ float dot16_fp8_f32(const float4 wv, const float4 xv) {
++  const __nv_fp8x2_e4m3* w2 = reinterpret_cast<const __nv_fp8x2_e4m3*>(&wv);
++  const __nv_fp8x2_e4m3* x2 = reinterpret_cast<const __nv_fp8x2_e4m3*>(&xv);
++  float acc = 0.0f;
++#pragma unroll
++  for (int i = 0; i < 8; ++i) {
++    const float2 w01 = static_cast<float2>(w2[i]);
++    const float2 x01 = static_cast<float2>(x2[i]);
++    acc = fmaf(w01.x, x01.x, acc);
++    acc = fmaf(w01.y, x01.y, acc);
++  }
++  return acc;
++}
++
++template <uint32_t N, uint32_t K, uint32_t kRows, uint32_t kUnroll, uint32_t kNumWarps>
++__global__ void __launch_bounds__(kNumWarps * 32) sm120_fp8_gemv_kernel(
++    bf16_t* __restrict__ out,
++    const uint8_t* __restrict__ x,
++    const uint8_t* __restrict__ w,
++    const float* __restrict__ alpha) {
++  __shared__ uint8_t sx[K];
++
++  const uint32_t tid = threadIdx.x;
++  for (uint32_t i = tid * kFp8VecSize; i < K; i += kNumWarps * 32 * kFp8VecSize) {
++    *reinterpret_cast<float4*>(sx + i) = *reinterpret_cast<const float4*>(x + i);
++  }
++  __syncthreads();
++
++  const uint32_t warp = tid / 32;
++  const uint32_t lane = tid % 32;
++  const uint32_t r0 = (blockIdx.x * kNumWarps + warp) * kRows;
++  if (r0 >= N) {
++    return;
++  }
++
++  float acc[kRows];
++#pragma unroll
++  for (uint32_t r = 0; r < kRows; ++r) {
++    acc[r] = 0.0f;
++  }
++
++  constexpr uint32_t kStep = 32 * kFp8VecSize * kUnroll;
++  if (r0 + kRows <= N) {
++    for (uint32_t k = lane * kFp8VecSize * kUnroll; k < K; k += kStep) {
++      float4 xv[kUnroll];
++#pragma unroll
++      for (uint32_t u = 0; u < kUnroll; ++u) {
++        xv[u] = *reinterpret_cast<const float4*>(sx + k + u * kFp8VecSize);
++      }
++#pragma unroll
++      for (uint32_t r = 0; r < kRows; ++r) {
++        const uint8_t* wr = w + static_cast<size_t>(r0 + r) * K + k;
++        float4 wv[kUnroll];
++#pragma unroll
++        for (uint32_t u = 0; u < kUnroll; ++u) {
++          wv[u] = __ldcs(reinterpret_cast<const float4*>(wr + u * kFp8VecSize));
++        }
++#pragma unroll
++        for (uint32_t u = 0; u < kUnroll; ++u) {
++          acc[r] += dot16_fp8_f32(wv[u], xv[u]);
++        }
++      }
++    }
++  } else {
++    for (uint32_t k = lane * kFp8VecSize * kUnroll; k < K; k += kStep) {
++#pragma unroll
++      for (uint32_t r = 0; r < kRows; ++r) {
++        if (r0 + r < N) {
++          const uint8_t* wr = w + static_cast<size_t>(r0 + r) * K + k;
++#pragma unroll
++          for (uint32_t u = 0; u < kUnroll; ++u) {
++            float4 wv = __ldcs(reinterpret_cast<const float4*>(wr + u * kFp8VecSize));
++            float4 xv = *reinterpret_cast<const float4*>(sx + k + u * kFp8VecSize);
++            acc[r] += dot16_fp8_f32(wv, xv);
++          }
++        }
++      }
++    }
++  }
++
++#pragma unroll
++  for (uint32_t r = 0; r < kRows; ++r) {
++#pragma unroll
++    for (uint32_t off = 16; off > 0; off >>= 1) {
++      acc[r] += __shfl_down_sync(0xffffffff, acc[r], off);
++    }
++  }
++  if (lane == 0) {
++    const float a = *alpha;
++#pragma unroll
++    for (uint32_t r = 0; r < kRows; ++r) {
++      if (r0 + r < N) {
++        out[r0 + r] = cast<bf16_t>(acc[r] * a);
++      }
++    }
++  }
++}
++
++template <uint32_t N, uint32_t K, uint32_t kRows, uint32_t kUnroll, uint32_t kNumWarps>
++struct Sm120Fp8GemvKernel {
++  static_assert(K % (32 * kFp8VecSize * kUnroll) == 0, "K must cover full unrolled warp strides");
++  static_assert(K <= 48 * 1024, "activation row must fit static shared memory");
++
++  static void
++  run(const tvm::ffi::TensorView x,
++      const tvm::ffi::TensorView w,
++      const tvm::ffi::TensorView alpha,
++      const tvm::ffi::TensorView out) {
++    using namespace host;
++
++    auto device = SymbolicDevice{};
++    device.set_options<kDLCUDA>();
++    TensorMatcher({1, K}).with_dtype<fp8_e4m3_t>().with_device(device).verify(x);
++    TensorMatcher({N, K}).with_dtype<fp8_e4m3_t>().with_device(device).verify(w);
++    TensorMatcher({1}).with_dtype<fp32_t>().with_device(device).verify(alpha);
++    TensorMatcher({1, N}).with_dtype<bf16_t>().with_device(device).verify(out);
++
++    constexpr uint32_t kRowsPerBlock = kRows * kNumWarps;
++    constexpr uint32_t kNumBlocks = (N + kRowsPerBlock - 1) / kRowsPerBlock;
++    LaunchKernel(kNumBlocks, kNumWarps * 32, device.unwrap())(
++        sm120_fp8_gemv_kernel<N, K, kRows, kUnroll, kNumWarps>,
++        static_cast<bf16_t*>(out.data_ptr()),
++        static_cast<const uint8_t*>(x.data_ptr()),
++        static_cast<const uint8_t*>(w.data_ptr()),
++        static_cast<const float*>(alpha.data_ptr()));
++  }
++};
++
++}  // namespace sglang
+diff --git a/python/sglang/kernels/ops/attention/triton_gdn_fused_proj.py b/python/sglang/kernels/ops/attention/triton_gdn_fused_proj.py
+index 8e39197bae..2d9e6b6032 100644
+--- a/python/sglang/kernels/ops/attention/triton_gdn_fused_proj.py
++++ b/python/sglang/kernels/ops/attention/triton_gdn_fused_proj.py
+@@ -173,6 +173,7 @@ def fused_qkvzba_split_reshape_cat_contiguous_kernel(
+     NUM_HEADS_V: tl.constexpr,
+     HEAD_QK: tl.constexpr,
+     HEAD_V: tl.constexpr,
++    V_POW2: tl.constexpr,
+ ):
+     i_bs, i_qk = tl.program_id(0), tl.program_id(1)
+ 
+@@ -199,25 +200,16 @@ def fused_qkvzba_split_reshape_cat_contiguous_kernel(
+         + i_qk * HEAD_QK
+         + tl.arange(0, HEAD_QK)
+     )
+-    # v for head group i_qk: in the all_v region
+-    blk_v_ptr = (
+-        mixed_qkvz
+-        + i_bs * TOTAL_QKVZ
+-        + TOTAL_Q
+-        + TOTAL_K
+-        + i_qk * V_PER_GROUP * HEAD_V
+-        + tl.arange(0, V_PER_GROUP * HEAD_V)
+-    )
+-    # z for head group i_qk: in the all_z region
+-    blk_z_ptr = (
+-        mixed_qkvz
+-        + i_bs * TOTAL_QKVZ
+-        + TOTAL_Q
+-        + TOTAL_K
+-        + TOTAL_V
+-        + i_qk * V_PER_GROUP * HEAD_V
+-        + tl.arange(0, V_PER_GROUP * HEAD_V)
++    # Base offsets of the v/z regions for head group i_qk. tl.arange only
++    # accepts power-of-two extents, so non-power-of-two group sizes (e.g. the
++    # v/k head ratio 3 of the dense 27B hybrids) walk the group one
++    # HEAD_V-sized head at a time; power-of-two groups keep the single wide
++    # vector access. V_POW2 arrives as a wrapper-computed constexpr so the
++    # dead branch is pruned before tl.arange validation.
++    v_ld_base = (
++        mixed_qkvz + i_bs * TOTAL_QKVZ + TOTAL_Q + TOTAL_K + i_qk * V_PER_GROUP * HEAD_V
+     )
++    z_ld_base = v_ld_base + TOTAL_V
+ 
+     # ── Write to output (identical layout to the interleaved kernel) ──
+     blk_q_st_ptr = mixed_qkv + i_bs * QKV_DIM_T + i_qk * HEAD_QK + tl.arange(0, HEAD_QK)
+@@ -228,24 +220,31 @@ def fused_qkvzba_split_reshape_cat_contiguous_kernel(
+         + i_qk * HEAD_QK
+         + tl.arange(0, HEAD_QK)
+     )
+-    blk_v_st_ptr = (
++    v_st_base = (
+         mixed_qkv
+         + i_bs * QKV_DIM_T
+         + NUM_HEADS_QK * HEAD_QK * 2
+         + i_qk * V_PER_GROUP * HEAD_V
+-        + tl.arange(0, V_PER_GROUP * HEAD_V)
+-    )
+-    blk_z_st_ptr = (
+-        z
+-        + i_bs * NUM_HEADS_V * HEAD_V
+-        + i_qk * V_PER_GROUP * HEAD_V
+-        + tl.arange(0, V_PER_GROUP * HEAD_V)
+     )
++    z_st_base = z + i_bs * NUM_HEADS_V * HEAD_V + i_qk * V_PER_GROUP * HEAD_V
+ 
+     tl.store(blk_q_st_ptr, tl.load(blk_q_ptr))
+     tl.store(blk_k_st_ptr, tl.load(blk_k_ptr))
+-    tl.store(blk_v_st_ptr, tl.load(blk_v_ptr))
+-    tl.store(blk_z_st_ptr, tl.load(blk_z_ptr))
++    if V_POW2:
++        offs_group = tl.arange(0, V_PER_GROUP * HEAD_V)
++        tl.store(v_st_base + offs_group, tl.load(v_ld_base + offs_group))
++        tl.store(z_st_base + offs_group, tl.load(z_ld_base + offs_group))
++    else:
++        offs_head = tl.arange(0, HEAD_V)
++        for i in tl.static_range(V_PER_GROUP):
++            tl.store(
++                v_st_base + i * HEAD_V + offs_head,
++                tl.load(v_ld_base + i * HEAD_V + offs_head),
++            )
++            tl.store(
++                z_st_base + i * HEAD_V + offs_head,
++                tl.load(z_ld_base + i * HEAD_V + offs_head),
++            )
+ 
+     # ── b and a from contiguous [all_b | all_a] ──
+     for i in tl.static_range(V_PER_GROUP):
+@@ -297,6 +296,7 @@ def fused_qkvzba_split_reshape_cat_contiguous(
+         device=mixed_ba.device,
+     )
+     a = torch.empty_like(b)
++    v_per_group = num_heads_v // num_heads_qk
+     grid = (batch * seq_len, num_heads_qk)
+     # Each program moves `v_per_group * head_v` elements for both v and z. For
+     # the small head-group ratios (<= 512 elements) a single warp is the best
+@@ -319,6 +319,7 @@ def fused_qkvzba_split_reshape_cat_contiguous(
+         num_heads_v,
+         head_qk,
+         head_v,
++        V_POW2=(v_per_group & (v_per_group - 1)) == 0,
+         num_warps=num_warps,
+         num_stages=3,
+     )
+diff --git a/python/sglang/kernels/ops/gemm/hopper_bf16_gemv.py b/python/sglang/kernels/ops/gemm/hopper_bf16_gemv.py
+new file mode 100644
+index 0000000000..5115720094
+--- /dev/null
++++ b/python/sglang/kernels/ops/gemm/hopper_bf16_gemv.py
+@@ -0,0 +1,63 @@
++from __future__ import annotations
++
++from typing import TYPE_CHECKING
++
++import torch
++
++from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
++
++if TYPE_CHECKING:
++    from tvm_ffi.module import Module
++
++# Hopper single-token bf16 GEMV (see csrc/gemm/hopper_bf16_gemv.cuh).
++# Decode at bs=1 is a pure weight-streaming workload; cuBLAS leaves 5-15%
++# DRAM bandwidth on the table for the mid-sized per-layer weights of dense
++# hybrid models (measured on H200: 3.2-3.9 TB/s vs a 4.3 TB/s copy ceiling).
++# One warp computes a few consecutive rows, the activation vector lives in
++# shared memory, and weights are streamed with evict-first loads.
++
++_MAX_K = 17408  # static smem limit (K * 2 bytes <= 48KB) with margin
++_MAX_N = 65536  # very large N (lm_head) is already at the bandwidth ceiling
++
++
++def _config(n: int) -> tuple[int, int, int]:
++    """(rows_per_warp, k_unroll, num_warps) tuned on H200."""
++    if n >= 8192:
++        return (2, 2, 8)
++    return (1, 2, 8)
++
++
++@cache_once
++def _jit_hopper_bf16_gemv_module(n: int, k: int) -> Module:
++    rows, unroll, warps = _config(n)
++    args = make_cpp_args(n, k, rows, unroll, warps)
++    return load_jit(
++        "hopper_bf16_gemv",
++        *args,
++        cuda_files=["gemm/hopper_bf16_gemv.cuh"],
++        cuda_wrappers=[("run", f"sglang::HopperBf16GemvKernel<{args}>::run")],
++        extra_cuda_cflags=["-O3"],
++    )
++
++
++def use_hopper_bf16_gemv(m: int, n: int, k: int) -> bool:
++    if not (
++        m == 1
++        and k % 512 == 0
++        and 512 <= k <= _MAX_K
++        and n % 8 == 0
++        and 64 <= n <= _MAX_N
++    ):
++        return False
++    # cuBLAS already runs at ~3.9 TB/s for mid-large N around 16K; the wins
++    # concentrate where its tiling underutilizes DRAM (small/odd N) and very
++    # wide N. Measured on H200 against cuBLAS 12.x.
++    return n < 12288 or n >= 32768
++
++
++def hopper_bf16_gemv(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
++    """y[1, N] = x[1, K] @ w[N, K]^T, all bf16, fp32 accumulation."""
++    out = torch.empty((1, w.shape[0]), dtype=x.dtype, device=x.device)
++    module = _jit_hopper_bf16_gemv_module(w.shape[0], w.shape[1])
++    module.run(x, w, out)
++    return out
+diff --git a/python/sglang/kernels/ops/gemm/sm120_fp8_gemv.py b/python/sglang/kernels/ops/gemm/sm120_fp8_gemv.py
+new file mode 100644
+index 0000000000..718fb466d2
+--- /dev/null
++++ b/python/sglang/kernels/ops/gemm/sm120_fp8_gemv.py
+@@ -0,0 +1,61 @@
++from __future__ import annotations
++
++from typing import TYPE_CHECKING
++
++import torch
++
++from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
++
++if TYPE_CHECKING:
++    from tvm_ffi.module import Module
++
++# SM120 single-token per-tensor-scale FP8 GEMV
++# (see csrc/gemm/sm120_fp8_gemv.cuh).
++#
++# On consumer/workstation Blackwell, cuBLAS serves M=1 fp8 GEMMs with SM89
++# tiles that reach only 50-70% of DRAM bandwidth for mid-sized N (a ~19us
++# wave-quantization floor). A warp-per-row streaming GEMV with evict-first
++# weight loads recovers most of the gap for the decode hot path.
++
++_MAX_K = 32768  # static smem limit: K bytes <= 48KB with margin
++_MAX_N = 32768  # very large N is served well by cuBLAS already
++
++
++def _config(n: int) -> tuple[int, int, int]:
++    """(rows_per_warp, k_unroll, num_warps)."""
++    if n >= 8192:
++        return (2, 1, 8)
++    return (1, 1, 8)
++
++
++@cache_once
++def _jit_sm120_fp8_gemv_module(n: int, k: int) -> Module:
++    rows, unroll, warps = _config(n)
++    args = make_cpp_args(n, k, rows, unroll, warps)
++    return load_jit(
++        "sm120_fp8_gemv",
++        *args,
++        cuda_files=["gemm/sm120_fp8_gemv.cuh"],
++        cuda_wrappers=[("run", f"sglang::Sm120Fp8GemvKernel<{args}>::run")],
++        extra_cuda_cflags=["-O3"],
++    )
++
++
++def use_sm120_fp8_gemv(m: int, n: int, k: int) -> bool:
++    return (
++        m == 1
++        and k % 512 == 0
++        and 512 <= k <= _MAX_K
++        and n % 16 == 0
++        and 256 <= n <= _MAX_N
++    )
++
++
++def sm120_fp8_gemv(
++    x_fp8: torch.Tensor, w_fp8: torch.Tensor, alpha: torch.Tensor
++) -> torch.Tensor:
++    """y[1, N] = (x[1, K] @ w[N, K]^T) * alpha; fp8 e4m3 in, bf16 out."""
++    out = torch.empty((1, w_fp8.shape[0]), dtype=torch.bfloat16, device=x_fp8.device)
++    module = _jit_sm120_fp8_gemv_module(w_fp8.shape[0], w_fp8.shape[1])
++    module.run(x_fp8, w_fp8, alpha, out)
++    return out
+diff --git a/python/sglang/srt/layers/attention/linear/gdn_backend.py b/python/sglang/srt/layers/attention/linear/gdn_backend.py
+index 0bc8fbd568..89c2e61e8c 100644
+--- a/python/sglang/srt/layers/attention/linear/gdn_backend.py
++++ b/python/sglang/srt/layers/attention/linear/gdn_backend.py
+@@ -64,29 +64,39 @@ elif is_cpu():
+ 
+ 
+ def flashinfer_gdn_prefill_default(model_runner: ModelRunner) -> Optional[str]:
+-    """FlashInfer for the narrow SM100 GDN prefill domain we validated, else None."""
++    """FlashInfer for the narrow SM90/SM100 GDN prefill domains we validated, else None."""
++    sm_major = torch.cuda.get_device_capability()[0] if is_cuda() else 0
+     if (
+         get_exec().mamba.linear_attn_prefill_backend is not None
+         or get_exec().mamba.linear_attn_backend != "triton"
+         or get_memory().enable_page_major_kv_layout
+-        or not is_cuda()
+-        or torch.cuda.get_device_capability()[0] != 10
++        or sm_major not in (9, 10)
+     ):
+         return None
+ 
++    # SM100 runs the CUDA>=13 CuTe-DSL chunk kernel on a bf16 state pool;
++    # SM90 runs the fused Hopper kernel on an fp32 state pool and tolerates
++    # larger chunks. Everything outside these validated domains keeps Triton.
+     cuda_version = torch.version.cuda
++    if sm_major == 10:
++        if cuda_version is None or int(cuda_version.split(".", 1)[0]) < 13:
++            return None
++        max_chunk = 8192
++        expected_state_dtype = torch.bfloat16
++    else:
++        max_chunk = 32768
++        expected_state_dtype = torch.float32
++
+     chunk_size = get_schedule().chunked_prefill_size
+     config = hybrid_gdn_config(model_runner.model_config)
+     if (
+-        cuda_version is None
+-        or int(cuda_version.split(".", 1)[0]) < 13
+-        or get_schedule().enable_dynamic_chunking
++        get_schedule().enable_dynamic_chunking
+         or chunk_size is None
+-        or not 1 <= chunk_size <= 8192
++        or not 1 <= chunk_size <= max_chunk
+         or getattr(config, "linear_key_head_dim", None) != 128
+         or getattr(config, "linear_value_head_dim", None) != 128
+         or model_runner.req_to_token_pool.mamba_pool.mamba_cache.temporal.dtype
+-        != torch.bfloat16
++        != expected_state_dtype
+     ):
+         return None
+ 
+@@ -97,7 +107,7 @@ def flashinfer_gdn_prefill_default(model_runner: ModelRunner) -> Optional[str]:
+     if not is_flashinfer_gdn_prefill_available():
+         return None
+ 
+-    rank0_log("Defaulting SM100 GDN prefill backend to FlashInfer.")
++    rank0_log(f"Defaulting SM{sm_major}0 GDN prefill backend to FlashInfer.")
+     return "flashinfer"
+ 
+ 
+diff --git a/python/sglang/srt/layers/attention/linear/kernels/gdn_flashinfer.py b/python/sglang/srt/layers/attention/linear/kernels/gdn_flashinfer.py
+index 7a9e75da5a..5818885695 100644
+--- a/python/sglang/srt/layers/attention/linear/kernels/gdn_flashinfer.py
++++ b/python/sglang/srt/layers/attention/linear/kernels/gdn_flashinfer.py
+@@ -163,6 +163,9 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
+ 
+         sm_major = torch.cuda.get_device_capability()[0]
+         self.use_state_pool = sm_major >= 10
++        # The SM120 chunked-prefill kernel only accepts float32 initial
++        # states; SM100 accepts the state-pool dtype directly.
++        self._prefill_needs_fp32_state = sm_major >= 12
+         self.supports_target_verify = sm_major in (9, 10)
+ 
+         if sm_major == 9 and self._prefill_fn is None:
+@@ -307,8 +310,12 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
+             # assigned to a real sequence; clamp them to 0 (the reserved dummy
+             # slot) so the FlashInfer kernel never reads out-of-bounds state.
+             ssm_cache_indices = cache_indices.clamp(min=0).to(torch.int64)
+-            initial_state_fi = ssm_states[ssm_cache_indices].contiguous()
+-            cu_seqlens = query_start_loc  # already int32
++            initial_state_fi = (
++                ssm_states[ssm_cache_indices].to(torch.float32)
++                if self._prefill_needs_fp32_state
++                else ssm_states[ssm_cache_indices].contiguous()
++            )
++            cu_seqlens = query_start_loc.to(torch.int64)  # kernel requires int64
+         else:
+             # SM90: preserve original negative-index handling (remap to last slot).
+             ssm_cache_indices = torch.where(
+diff --git a/python/sglang/srt/layers/quantization/modelopt_quant.py b/python/sglang/srt/layers/quantization/modelopt_quant.py
+index b510394a6f..a521b04a2d 100755
+--- a/python/sglang/srt/layers/quantization/modelopt_quant.py
++++ b/python/sglang/srt/layers/quantization/modelopt_quant.py
+@@ -4,6 +4,7 @@
+ from __future__ import annotations
+ 
+ import logging
++import os
+ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+ 
+ import regex as re
+@@ -508,6 +509,14 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
+             self.use_marlin = (
+                 envs.SGLANG_FORCE_FP8_MARLIN.get() or can_auto_enable_marlin_fp8()
+             )
++        # SM120 decode fast path: cuBLAS serves M=1 fp8 GEMMs with SM89 tiles
++        # at 50-70% DRAM bandwidth for mid-sized N; a streaming GEMV recovers
++        # the gap. Kill switch: SGLANG_DISABLE_SM120_FP8_GEMV=1.
++        self.use_sm120_gemv = (
++            is_cuda()
++            and torch.cuda.get_device_capability()[0] == 12
++            and os.environ.get("SGLANG_DISABLE_SM120_FP8_GEMV", "0") != "1"
++        )
+ 
+     def create_weights(
+         self,
+@@ -577,6 +586,17 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
+             max_w_scale = convert_to_channelwise(max_w_scale, layer.logical_widths)
+         layer.weight_scale = Parameter(max_w_scale, requires_grad=False)
+         layer.input_scale = Parameter(layer.input_scale.max(), requires_grad=False)
++        if (
++            self.use_sm120_gemv
++            and layer.weight_scale.numel() == 1
++            and layer.input_scale.numel() == 1
++        ):
++            # Combined GEMM epilogue scale for the SM120 M=1 GEMV fast path.
++            layer.sm120_gemv_alpha = (
++                (layer.input_scale.float() * layer.weight_scale.float())
++                .reshape(1)
++                .contiguous()
++            )
+         if self.use_marlin:
+             prepare_fp8_layer_for_marlin(layer)
+             # Marlin uses FP8 weights with unquantized activations.
+@@ -599,6 +619,26 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
+                 size_k=layer.input_size_per_partition,
+                 bias=bias,
+             )
++        if (
++            self.use_sm120_gemv
++            and bias is None
++            and x.dim() == 2
++            and x.shape[0] == 1
++            and hasattr(layer, "sm120_gemv_alpha")
++        ):
++            from sglang.kernels.ops.gemm.sm120_fp8_gemv import (
++                sm120_fp8_gemv,
++                use_sm120_fp8_gemv,
++            )
++
++            # layer.weight is the [K, N] transposed view of an [N, K]-contiguous
++            # buffer, so .t() recovers the row-major weight the GEMV streams.
++            w = layer.weight.t()
++            if use_sm120_fp8_gemv(1, w.shape[0], w.shape[1]) and w.is_contiguous():
++                from sglang.kernels.ops.quantization.fp8_kernel import static_quant_fp8
++
++                qinput, _ = static_quant_fp8(x, layer.input_scale, repeat_scale=False)
++                return sm120_fp8_gemv(qinput, w, layer.sm120_gemv_alpha)
+         if layer.use_flashinfer_bmm:
+             return apply_fp8_linear_bmm_flashinfer(
+                 input=x,
+diff --git a/python/sglang/srt/layers/quantization/unquant.py b/python/sglang/srt/layers/quantization/unquant.py
+index ed89a2be18..bee78ee3b9 100644
+--- a/python/sglang/srt/layers/quantization/unquant.py
++++ b/python/sglang/srt/layers/quantization/unquant.py
+@@ -72,6 +72,7 @@ if _use_aiter:
+ class Bf16GemmBackend(Enum):
+     AUTO = "auto"
+     CUTEDSL = "cutedsl"
++    GEMV = "gemv"
+     TORCH = "torch"
+ 
+     def is_auto(self) -> bool:
+@@ -80,10 +81,15 @@ class Bf16GemmBackend(Enum):
+     def is_cutedsl(self) -> bool:
+         return self == Bf16GemmBackend.CUTEDSL
+ 
++    def is_gemv(self) -> bool:
++        return self == Bf16GemmBackend.GEMV
++
+ 
+ _BF16_GEMM_BACKEND: Optional[Bf16GemmBackend] = None
+ _cutedsl_bf16_gemm = None
+ _use_cutedsl_bf16_gemm = None
++_hopper_bf16_gemv = None
++_use_hopper_bf16_gemv = None
+ 
+ 
+ def initialize_bf16_gemm_config(server_args: ServerArgs) -> None:
+@@ -99,7 +105,19 @@ def initialize_bf16_gemm_config(server_args: ServerArgs) -> None:
+ 
+     backend = Bf16GemmBackend(backend_str)
+ 
+-    if backend.is_cutedsl():
++    if backend.is_gemv():
++        if torch.cuda.get_device_capability()[0] != 9:
++            raise ValueError("--bf16-gemm-backend gemv requires SM90 (Hopper)")
++
++        global _hopper_bf16_gemv, _use_hopper_bf16_gemv
++        from sglang.kernels.ops.gemm.hopper_bf16_gemv import (
++            hopper_bf16_gemv,
++            use_hopper_bf16_gemv,
++        )
++
++        _hopper_bf16_gemv = hopper_bf16_gemv
++        _use_hopper_bf16_gemv = use_hopper_bf16_gemv
++    elif backend.is_cutedsl():
+         if server_args.enable_deterministic_inference:
+             raise ValueError(
+                 "--bf16-gemm-backend cutedsl is batch-size dependent and cannot "
+@@ -129,6 +147,16 @@ def _bf16_gemm_dispatch_fake(
+ def bf16_gemm_dispatch(
+     x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]
+ ) -> torch.Tensor:
++    if (
++        _use_hopper_bf16_gemv is not None
++        and bias is None
++        and _use_hopper_bf16_gemv(
++            x.numel() // x.shape[-1], weight.shape[0], weight.shape[1]
++        )
++    ):
++        return _hopper_bf16_gemv(x.view(-1, x.shape[-1]), weight).view(
++            *x.shape[:-1], -1
++        )
+     if _use_cutedsl_bf16_gemm is not None and _use_cutedsl_bf16_gemm(
+         x.numel() // x.shape[-1], weight.shape[0], weight.shape[1]
+     ):
+diff --git a/python/sglang/srt/models/deepseek_v4_dspark.py b/python/sglang/srt/models/deepseek_v4_dspark.py
+index c93c84fad8..99768486b9 100644
+--- a/python/sglang/srt/models/deepseek_v4_dspark.py
++++ b/python/sglang/srt/models/deepseek_v4_dspark.py
+@@ -43,6 +43,7 @@ from sglang.srt.models.dspark import (
+     DSparkConfidenceHead,
+     StepSampler,
+     gather_and_crop_vocab,
++    project_through_lm_head,
+     run_markov_block,
+ )
+ from sglang.srt.runtime_context import get_parallel
+@@ -771,10 +772,10 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
+         last = self.stages[-1]
+         x = last.norm(x_post_hc)
+         weight = self.lm_head.weight
+-        if self._use_fp32_lm_head:
++        if self._use_fp32_lm_head and weight.is_floating_point():
+             local_logits = F.linear(x.float(), weight.float())
+         else:
+-            local_logits = torch.matmul(x.to(weight.dtype), weight.T)
++            local_logits = project_through_lm_head(x, self.lm_head)
+         if self._opt_markov_w2_tp_shard:
+             return local_logits
+         return gather_and_crop_vocab(local_logits, self.lm_head)
+diff --git a/python/sglang/srt/models/dspark.py b/python/sglang/srt/models/dspark.py
+index 4116f527b8..69ecbfdd08 100644
+--- a/python/sglang/srt/models/dspark.py
++++ b/python/sglang/srt/models/dspark.py
+@@ -9,6 +9,7 @@ from torch import nn
+ 
+ from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
+ from sglang.srt.environ import envs
++from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
+ from sglang.srt.model_loader.weight_utils import default_weight_loader
+ from sglang.srt.models.dflash import DFlashDraftModel
+ from sglang.srt.speculative.dflash_utils import can_dflash_slice_qkv_weight
+@@ -32,6 +33,16 @@ def gather_and_crop_vocab(
+     return full_logits[..., : int(lm_head.org_vocab_size)]
+ 
+ 
++def project_through_lm_head(hidden: torch.Tensor, lm_head: nn.Module) -> torch.Tensor:
++    """Project draft hidden states through the target head; a quantized head
++    stores `weight` packed, so it needs its own kernel instead of a matmul."""
++    quant_method = lm_head.quant_method
++    if should_apply_lm_head_quant_method(lm_head, quant_method):
++        return quant_method.apply(lm_head, hidden, None)
++    weight = lm_head.weight
++    return torch.matmul(hidden.to(weight.dtype), weight.T)
++
++
+ def run_markov_block(
+     head: nn.Module,
+     base_logits: torch.Tensor,
+@@ -409,10 +420,7 @@ class DSparkDraftMixin:
+             )
+         if self.logits_mup_width_multiplier:
+             hidden = hidden / self.logits_mup_width_multiplier
+-        weight = self.lm_head.weight
+-        if hidden.dtype != weight.dtype:
+-            hidden = hidden.to(weight.dtype)
+-        local_logits = torch.matmul(hidden, weight.T)
++        local_logits = project_through_lm_head(hidden, self.lm_head)
+         base_logits = gather_and_crop_vocab(local_logits, self.lm_head)
+         return base_logits, None
+ 
+diff --git a/python/sglang/srt/models/qwen2_moe.py b/python/sglang/srt/models/qwen2_moe.py
+index dabfedbf1e..1edb09655a 100644
+--- a/python/sglang/srt/models/qwen2_moe.py
++++ b/python/sglang/srt/models/qwen2_moe.py
+@@ -206,12 +206,50 @@ class Qwen2MoeMLP(nn.Module):
+                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
+             )
+         self.act_fn = SiluAndMul()
++        # Set externally (see qwen3_5.py) when both projections are NVFP4 and
++        # the FlashInfer fused SiLU+mul+FP4-quant kernel is available. The
++        # fused path replaces act_fn + the down_proj input quantization with a
++        # single kernel and hands down_proj a prequantized (fp4, scale) tuple.
++        self._enable_silu_fp4_quant_fusion = False
++        self._masked_m_cache: dict = {}
++        # Lazily derived after weight load (input_scale_inv does not exist yet
++        # at construction time); the fused kernel requires a 1-D global scale.
++        self._down_input_scale_inv_1d = None
++
++    def _silu_fp4_quant_fused(self, gate_up: torch.Tensor) -> tuple:
++        from flashinfer import silu_and_mul_scaled_nvfp4_experts_quantize
++
++        if self._down_input_scale_inv_1d is None:
++            self._down_input_scale_inv_1d = self.down_proj.input_scale_inv.reshape(1)
++        num_tokens = gate_up.shape[0]
++        masked_m = self._masked_m_cache.get(num_tokens)
++        if masked_m is None:
++            masked_m = torch.tensor(
++                [num_tokens], dtype=torch.int32, device=gate_up.device
++            )
++            self._masked_m_cache[num_tokens] = masked_m
++        y_fp4, y_sf = silu_and_mul_scaled_nvfp4_experts_quantize(
++            gate_up.unsqueeze(0),
++            masked_m,
++            self._down_input_scale_inv_1d,
++        )
++        # [M, K/2, 1] -> [M, K/2]; scale: expert-grouped 6-D swizzle
++        # (32, 4, m_blocks, 4, K/64, 1) -> the dense swizzled layout
++        # fp4_gemm expects (verified bit-exact vs fp4_quantize up to FP4
++        # rounding ties for M in 64..8192).
++        y_fp4 = y_fp4.squeeze(-1).view(torch.uint8)
++        m_padded = y_sf.shape[2] * y_sf.shape[0] * y_sf.shape[3]  # m_blocks*32*4
++        y_sf = y_sf.view(torch.uint8).permute(2, 4, 0, 1, 3, 5).reshape(m_padded, -1)
++        return y_fp4, y_sf
+ 
+     def forward(
+         self,
+         x,
+     ):
+         gate_up, _ = self.gate_up_proj(x)
++        if self._enable_silu_fp4_quant_fusion and not isinstance(gate_up, tuple):
++            x, _ = self.down_proj(self._silu_fp4_quant_fused(gate_up))
++            return x
+         x = self.act_fn(gate_up)
+         x, _ = self.down_proj(x)
+         return x
+diff --git a/python/sglang/srt/models/qwen3_5.py b/python/sglang/srt/models/qwen3_5.py
+index a2fb07c8ac..cb78f9d018 100644
+--- a/python/sglang/srt/models/qwen3_5.py
++++ b/python/sglang/srt/models/qwen3_5.py
+@@ -15,6 +15,7 @@
+ """Inference-only Qwen3.5 model and Qwen3.5 MoE model compatible with HuggingFace weights."""
+ 
+ import logging
++import os
+ from functools import lru_cache
+ from typing import Iterable, Optional, Set, Tuple, Union
+ 
+@@ -139,9 +140,13 @@ _is_amx_available = cpu_has_amx_support()
+ # Head-group ratios (num_v_heads // num_k_heads) served by the fused
+ # split/reshape/cat Triton kernel. On AMD/aiter the ratio-8 layout is also
+ # covered by the fused kernel, which removes the two `.contiguous()` copies
+-# plus the `torch.cat` of the unfused fallback. Other backends keep the
+-# original tuple so their control flow is unchanged.
+-_GDN_FUSED_QKVZBA_RATIOS = (1, 2, 4, 8) if _use_aiter else (1, 2, 4)
++# plus the `torch.cat` of the unfused fallback. On CUDA the ratio-3 dense 27B
++# layout is handled by the Triton kernel's per-head walk (the CPU fused op
++# still requires a power-of-two group). Other backends keep the original
++# tuple so their control flow is unchanged.
++_GDN_FUSED_QKVZBA_RATIOS = (
++    (1, 2, 4, 8) if _use_aiter else (1, 2, 3, 4) if _is_cuda else (1, 2, 4)
++)
+ 
+ cached_get_processor = lru_cache(get_processor)
+ 
+@@ -153,6 +158,32 @@ def _disable_shared_experts_fusion() -> bool:
+     return is_shared_experts_fusion_disabled()
+ 
+ 
++def _maybe_enable_silu_fp4_quant_fusion(mlp: nn.Module) -> None:
++    """Fuse SiLU+mul with the down_proj NVFP4 input quantization.
++
++    Replaces the separate act_and_mul and per-token FP4 quantize kernels with
++    one FlashInfer kernel and feeds down_proj a prequantized (fp4, scale)
++    tuple. Enabled when both dense-MLP projections use the NVFP4 (W4A4)
++    linear method; kill switch: SGLANG_DISABLE_SILU_FP4_QUANT_FUSION=1.
++    """
++    if os.environ.get("SGLANG_DISABLE_SILU_FP4_QUANT_FUSION", "0") == "1":
++        return
++    from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4LinearMethod
++
++    if not (
++        isinstance(mlp.gate_up_proj.quant_method, ModelOptFp4LinearMethod)
++        and isinstance(mlp.down_proj.quant_method, ModelOptFp4LinearMethod)
++    ):
++        return
++    try:
++        from flashinfer import silu_and_mul_scaled_nvfp4_experts_quantize  # noqa: F401
++    except ImportError:
++        return
++    mlp._enable_silu_fp4_quant_fusion = True
++    mlp.down_proj._accepts_prequantized_fp4 = True
++    logger.info("Enabled fused SiLU+mul+FP4-quant for dense MLP down_proj input.")
++
++
+ if _is_cuda:
+     from sglang.kernels.ops.attention.fused_qk_rmsnorm_rope_gate import (
+         fused_qk_gemma_rmsnorm_rope_gate,
+@@ -746,6 +777,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
+                 quant_config=quant_config,
+                 prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
+             )
++            _maybe_enable_silu_fp4_quant_fusion(self.mlp)
+             is_layer_sparse = False
+             is_previous_layer_sparse = False
+             is_next_layer_sparse = False
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index 0eca8eee21..248e5ae6b5 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -312,7 +312,7 @@ FP4_GEMM_RUNNER_BACKEND_CHOICES = [
+     "marlin",
+ ]
+ 
+-BF16_GEMM_BACKEND_CHOICES = ["auto", "cutedsl", "torch"]
++BF16_GEMM_BACKEND_CHOICES = ["auto", "cutedsl", "gemv", "torch"]
+ 
+ RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "priority"]
+ RETRACTION_POLICY_CHOICES = ["length", "priority"]
+diff --git a/python/sglang/srt/speculative/dspark_components/dspark_draft_sampler.py b/python/sglang/srt/speculative/dspark_components/dspark_draft_sampler.py
+index a01c93a7a8..66ec53d98d 100644
+--- a/python/sglang/srt/speculative/dspark_components/dspark_draft_sampler.py
++++ b/python/sglang/srt/speculative/dspark_components/dspark_draft_sampler.py
+@@ -17,6 +17,15 @@ logger = logging.getLogger(__name__)
+ _CAPTURE_HEADROOM_GB = 1.0
+ 
+ 
++def _base_logits_dtype(model) -> torch.dtype:
++    """Dtype of the block logits; a quantized head's packed `weight` carries no
++    logits dtype, its kernel emits the activation (draft param) dtype instead."""
++    weight = model.lm_head.weight
++    if weight.is_floating_point():
++        return weight.dtype
++    return next(model.markov_head.parameters()).dtype
++
++
+ def greedy_step_sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
+     del step_idx
+     return torch.argmax(step_logits, dim=-1)
+@@ -70,7 +79,7 @@ class DsparkDraftSampler:
+             )
+             self.corrected_out = torch.empty(
+                 (max_bs * self.gamma, vocab),
+-                dtype=model.lm_head.weight.dtype,
++                dtype=_base_logits_dtype(model),
+                 device=device,
+             )
+ 
+@@ -144,7 +153,7 @@ def _resolve_folded_sampling(*, model, gamma, max_bs, device, tp_rank) -> bool:
+         return True
+     vocab = int(model.lm_head.org_vocab_size)
+     noise_bytes = max_bs * vocab * 4
+-    logits_bytes = max_bs * gamma * vocab * model.lm_head.weight.dtype.itemsize
++    logits_bytes = max_bs * gamma * vocab * _base_logits_dtype(model).itemsize
+     need_gb = (noise_bytes + logits_bytes) / (1 << 30)
+     available_gb = get_available_gpu_memory(device, torch.cuda.current_device())
+     if available_gb - need_gb >= _CAPTURE_HEADROOM_GB:
+diff --git a/test/registered/attention/test_gdn_fused_split_head_ratios.py b/test/registered/attention/test_gdn_fused_split_head_ratios.py
+new file mode 100644
+index 0000000000..fd3081088d
+--- /dev/null
++++ b/test/registered/attention/test_gdn_fused_split_head_ratios.py
+@@ -0,0 +1,91 @@
++import unittest
++
++import torch
++
++from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
++    fused_qkvzba_split_reshape_cat_contiguous,
++)
++from sglang.test.ci.ci_register import register_cuda_ci
++
++register_cuda_ci(est_time=3, stage="base-b", runner_config="1-gpu-large")
++
++
++def _reference_split(mixed_qkvz, mixed_ba, num_heads_qk, num_heads_v, head_qk, head_v):
++    """Plain-slicing reference for the contiguous [Q|K|V|Z] / [B|A] layouts."""
++    batch = mixed_qkvz.shape[0]
++    total_q = num_heads_qk * head_qk
++    total_v = num_heads_v * head_v
++    q = mixed_qkvz[:, :total_q]
++    k = mixed_qkvz[:, total_q : 2 * total_q]
++    v = mixed_qkvz[:, 2 * total_q : 2 * total_q + total_v]
++    z = mixed_qkvz[:, 2 * total_q + total_v :]
++    mixed_qkv = torch.cat((q, k, v), dim=-1).contiguous()
++    b = mixed_ba[:, :num_heads_v].contiguous()
++    a = mixed_ba[:, num_heads_v:].contiguous()
++    return (
++        mixed_qkv,
++        z.reshape(batch, num_heads_v, head_v).contiguous(),
++        b,
++        a,
++    )
++
++
++@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
++class TestGdnFusedSplitHeadRatios(unittest.TestCase):
++    """The fused contiguous split must be exact for every supported v/k head
++    ratio, including the non-power-of-two ratio 3 of the dense 27B hybrids
++    (served by the per-head walk instead of one wide vector access)."""
++
++    HEAD_QK = 128
++    HEAD_V = 128
++    NUM_HEADS_QK = 16
++
++    def _run_ratio(self, ratio: int, batch: int = 33) -> None:
++        torch.manual_seed(ratio)
++        num_heads_v = self.NUM_HEADS_QK * ratio
++        total_qkvz = (
++            2 * self.NUM_HEADS_QK * self.HEAD_QK + 2 * num_heads_v * self.HEAD_V
++        )
++        mixed_qkvz = torch.randn(batch, total_qkvz, dtype=torch.bfloat16, device="cuda")
++        mixed_ba = torch.randn(
++            batch, 2 * num_heads_v, dtype=torch.bfloat16, device="cuda"
++        )
++
++        got_qkv, got_z, got_b, got_a = fused_qkvzba_split_reshape_cat_contiguous(
++            mixed_qkvz,
++            mixed_ba,
++            self.NUM_HEADS_QK,
++            num_heads_v,
++            self.HEAD_QK,
++            self.HEAD_V,
++        )
++        ref_qkv, ref_z, ref_b, ref_a = _reference_split(
++            mixed_qkvz,
++            mixed_ba,
++            self.NUM_HEADS_QK,
++            num_heads_v,
++            self.HEAD_QK,
++            self.HEAD_V,
++        )
++
++        # A pure data-movement kernel must be bitwise exact.
++        torch.testing.assert_close(got_qkv.view(-1), ref_qkv.view(-1), rtol=0, atol=0)
++        torch.testing.assert_close(got_z.reshape(-1), ref_z.reshape(-1), rtol=0, atol=0)
++        torch.testing.assert_close(got_b.view(-1), ref_b.view(-1), rtol=0, atol=0)
++        torch.testing.assert_close(got_a.view(-1), ref_a.view(-1), rtol=0, atol=0)
++
++    def test_ratio_1(self):
++        self._run_ratio(1)
++
++    def test_ratio_2(self):
++        self._run_ratio(2)
++
++    def test_ratio_3(self):
++        self._run_ratio(3)
++
++    def test_ratio_4(self):
++        self._run_ratio(4)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/test/registered/gemm/test_hopper_bf16_gemv.py b/test/registered/gemm/test_hopper_bf16_gemv.py
+new file mode 100644
+index 0000000000..9e85c4c1e8
+--- /dev/null
++++ b/test/registered/gemm/test_hopper_bf16_gemv.py
+@@ -0,0 +1,68 @@
++"""
++Tests the Hopper single-token bf16 GEMV JIT kernel against torch (cuBLAS +
++fp32 reference) on the dispatch domains where the backend enables it.
++"""
++
++import unittest
++
++import torch
++
++from sglang.test.ci.ci_register import register_cuda_ci
++
++register_cuda_ci(est_time=6, stage="base-b", runner_config="1-gpu-large")
++
++
++def _is_sm90() -> bool:
++    return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9
++
++
++@unittest.skipIf(not _is_sm90(), "Hopper bf16 GEMV requires an SM90 GPU")
++class TestHopperBf16Gemv(unittest.TestCase):
++    def _run_case(self, n, k, seed=0):
++        from sglang.kernels.ops.gemm.hopper_bf16_gemv import hopper_bf16_gemv
++
++        torch.manual_seed(seed)
++        x = torch.randn(1, k, dtype=torch.bfloat16, device="cuda")
++        w = torch.randn(n, k, dtype=torch.bfloat16, device="cuda") * 0.05
++        out = hopper_bf16_gemv(x, w)
++        ref = x.float() @ w.float().t()
++        cub = (x @ w.t()).float()
++        err = (out.float() - ref).abs().max().item()
++        err_cub = (cub - ref).abs().max().item()
++        # fp32 accumulation + single warp-tree reduction: at least as tight as
++        # cuBLAS (which split-K reduces) against the fp32 reference.
++        self.assertLessEqual(err, max(err_cub * 2.0, 1e-2), (n, k, err, err_cub))
++        self.assertFalse(torch.isnan(out).any().item(), (n, k))
++
++    def test_dispatch_domain_shapes(self):
++        # Representative dense-decode shapes (Qwen3.6-27B): out_proj/attn_o,
++        # attn_qkv, mlp_down, mlp_gate_up, in_proj_ba.
++        for n, k in [
++            (5120, 6144),
++            (8192, 5120),
++            (5120, 17408),
++            (34816, 5120),
++            (96, 5120),
++        ]:
++            self._run_case(n, k)
++
++    def test_tail_rows(self):
++        # N not divisible by rows_per_block exercises the guarded tail path.
++        for n in [104, 5128, 8200]:
++            self._run_case(n, 5120)
++
++    def test_predicate(self):
++        from sglang.kernels.ops.gemm.hopper_bf16_gemv import use_hopper_bf16_gemv
++
++        self.assertTrue(use_hopper_bf16_gemv(1, 5120, 6144))
++        self.assertTrue(use_hopper_bf16_gemv(1, 34816, 5120))
++        # batched decode, odd K, huge N (lm_head), and the near-optimal-cuBLAS
++        # mid-N band must all fall back.
++        self.assertFalse(use_hopper_bf16_gemv(2, 5120, 6144))
++        self.assertFalse(use_hopper_bf16_gemv(1, 5120, 6000))
++        self.assertFalse(use_hopper_bf16_gemv(1, 248320, 5120))
++        self.assertFalse(use_hopper_bf16_gemv(1, 16384, 5120))
++
++
++if __name__ == "__main__":
++    unittest.main()
+-- 
+2.34.1
+

@@ -1,0 +1,188 @@
+From 2087b080909b21c1f19746bfe6f33979e298f89b Mon Sep 17 00:00:00 2001
+From: Shuwen Wang <47200617+alphabetc1@users.noreply.github.com>
+Date: Fri, 28 Aug 2026 11:54:11 +0800
+Subject: [PATCH 14/38] [HiCache] Stop populating host-pool mmaps twice (-13%
+ allocation time) (#36705)
+
+Co-authored-by: DellCurry <30748980+DellCurry@users.noreply.github.com>
+Co-authored-by: Claude Opus 5 <noreply@anthropic.com>
+---
+ .../mem_cache/storage/mmap/mmap_allocator.py  | 72 ++++++++++++-------
+ .../unit/mem_cache/test_mmap_allocator.py     | 43 +++++++++++
+ 2 files changed, 89 insertions(+), 26 deletions(-)
+
+diff --git a/python/sglang/srt/mem_cache/storage/mmap/mmap_allocator.py b/python/sglang/srt/mem_cache/storage/mmap/mmap_allocator.py
+index a3afd7ca3d..1e966e4dff 100644
+--- a/python/sglang/srt/mem_cache/storage/mmap/mmap_allocator.py
++++ b/python/sglang/srt/mem_cache/storage/mmap/mmap_allocator.py
+@@ -1,5 +1,6 @@
+ import ctypes
+ import ctypes.util
++import functools
+ import logging
+ import math
+ import mmap
+@@ -41,6 +42,49 @@ _MAP_HUGE_2MB = 21 << 26  # 0x1400000
+ _MAP_HUGE_1GB = 30 << 26  # 0x78000000
+ _MAP_FAILED = ctypes.c_void_p(-1).value
+ _MADV_POPULATE_WRITE = getattr(mmap, "MADV_POPULATE_WRITE", 23)
++_PROT_RW = mmap.PROT_READ | mmap.PROT_WRITE
++
++
++@functools.cache
++def _has_madv_populate_write() -> bool:
++    """Whether this kernel implements MADV_POPULATE_WRITE (Linux 5.14+).
++
++    Probed once on a single page. Probing on the real allocation is not an
++    option: the answer decides how that allocation gets pre-faulted.
++    """
++    try:
++        probe = mmap.mmap(
++            -1,
++            mmap.PAGESIZE,
++            flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS,
++            prot=_PROT_RW,
++        )
++    except OSError:
++        return False
++    try:
++        probe.madvise(_MADV_POPULATE_WRITE)
++        return True
++    except (OSError, ValueError):
++        return False
++    finally:
++        probe.close()
++
++
++def _mmap_prefaulted(fileno: int, alloc_bytes: int, flags: int) -> mmap.mmap:
++    """mmap `alloc_bytes` with every page already faulted in and writable.
++
++    cudaHostRegister has to pin real, pre-faulted pages, so these mappings can
++    never be handed back lazily. MAP_POPULATE and MADV_POPULATE_WRITE each give
++    that guarantee on their own, but asking for both makes the kernel walk the
++    whole mapping twice. Prefer the madvise, which additionally reports a
++    failure (e.g. ENOMEM) instead of leaving pages quietly unpopulated, and fall
++    back to MAP_POPULATE only where the kernel lacks it.
++    """
++    if _has_madv_populate_write():
++        mm = mmap.mmap(fileno, alloc_bytes, flags=flags, prot=_PROT_RW)
++        mm.madvise(_MADV_POPULATE_WRITE)
++        return mm
++    return mmap.mmap(fileno, alloc_bytes, flags=flags | _MAP_POPULATE, prot=_PROT_RW)
+ 
+ 
+ def _alloc_hugepage(n_bytes: int, alloc_bytes: int, extra_flags: int) -> ctypes.Array:
+@@ -120,19 +164,7 @@ def alloc_mmap(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
+     # Plain mmap path -- used directly when no hugepages requested, or as fallback.
+     # torch.frombuffer keeps a reference to mm inside the tensor storage, so mm
+     # stays alive until the tensor is freed and mmap.mmap.__del__ calls munmap.
+-    mm = mmap.mmap(
+-        -1,
+-        alloc_bytes,
+-        flags=mmap.MAP_SHARED | mmap.MAP_ANONYMOUS | _MAP_POPULATE,
+-        prot=mmap.PROT_READ | mmap.PROT_WRITE,
+-    )
+-    try:
+-        # MADV_POPULATE_WRITE guarantees pages are populated and writable,
+-        # throwing an error on failure (e.g. out of memory).
+-        mm.madvise(_MADV_POPULATE_WRITE)
+-    except OSError:
+-        # Fall back to MAP_POPULATE if MADV_POPULATE_WRITE is not supported (<5.14 kernel).
+-        pass
++    mm = _mmap_prefaulted(-1, alloc_bytes, mmap.MAP_SHARED | mmap.MAP_ANONYMOUS)
+     return torch.frombuffer(mm, dtype=dtype, count=math.prod(dims)).reshape(dims)
+ 
+ 
+@@ -179,19 +211,7 @@ def alloc_shm(dims: tuple, dtype: torch.dtype) -> tuple[torch.Tensor, int, mmap.
+ 
+     try:
+         os.ftruncate(fd, alloc_bytes)
+-        mm = mmap.mmap(
+-            fd,
+-            alloc_bytes,
+-            flags=mmap.MAP_SHARED | _MAP_POPULATE,
+-            prot=mmap.PROT_READ | mmap.PROT_WRITE,
+-        )
+-        try:
+-            # MADV_POPULATE_WRITE guarantees pages are populated and writable,
+-            # throwing an error on failure (e.g. out of memory).
+-            mm.madvise(_MADV_POPULATE_WRITE)
+-        except OSError:
+-            # Fall back to MAP_POPULATE if MADV_POPULATE_WRITE is not supported (<5.14 kernel).
+-            pass
++        mm = _mmap_prefaulted(fd, alloc_bytes, mmap.MAP_SHARED)
+     except Exception as e:
+         if fd is not None:
+             os.close(fd)
+diff --git a/test/registered/unit/mem_cache/test_mmap_allocator.py b/test/registered/unit/mem_cache/test_mmap_allocator.py
+index 0f1af9c4dd..d41d95eae8 100644
+--- a/test/registered/unit/mem_cache/test_mmap_allocator.py
++++ b/test/registered/unit/mem_cache/test_mmap_allocator.py
+@@ -5,14 +5,18 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+ import sys
+ 
+ sys.modules["libtpu"] = None
++import ctypes
++import ctypes.util
+ import mmap
+ import os
+ import unittest
++import unittest.mock
+ 
+ import torch
+ 
+ from sglang.srt.mem_cache.pool_host.common import ShmHostTensorAllocator
+ from sglang.srt.mem_cache.storage.mmap import alloc_mmap, alloc_shm
++from sglang.srt.mem_cache.storage.mmap.mmap_allocator import _mmap_prefaulted
+ 
+ 
+ class TestMmapAllocator(unittest.TestCase):
+@@ -50,6 +54,45 @@ class TestMmapAllocator(unittest.TestCase):
+         mm.close()
+         os.close(fd)
+ 
++    def _assert_resident(self, mm, alloc_bytes):
++        # mincore() reports per-page residency, so the invariant is checked
++        # rather than inferred from the flags that were passed.
++        addr = ctypes.addressof(ctypes.c_char.from_buffer(mm))
++        npages = alloc_bytes // mmap.PAGESIZE
++        vec = (ctypes.c_ubyte * npages)()
++        libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
++        if libc.mincore(ctypes.c_void_p(addr), ctypes.c_size_t(alloc_bytes), vec) != 0:
++            self.skipTest("mincore unavailable")
++        self.assertTrue(all(v & 1 for v in vec), "mapping was not fully pre-faulted")
++
++    def test_mmap_prefaulted_leaves_no_lazy_page(self):
++        """Both populate paths must return a mapping with every page resident.
++
++        cudaHostRegister pins these buffers, so a page still unfaulted at
++        registration lets the device read memory that is not backed yet.
++        """
++        alloc_bytes = 64 * mmap.PAGESIZE
++        flags = mmap.MAP_SHARED | mmap.MAP_ANONYMOUS
++
++        with self.subTest(path="madvise"):
++            mm = _mmap_prefaulted(-1, alloc_bytes, flags)
++            try:
++                self._assert_resident(mm, alloc_bytes)
++            finally:
++                mm.close()
++
++        # MAP_POPULATE is unreachable on a 5.14+ kernel, so CI never runs it;
++        # force the branch or it ships untested.
++        with self.subTest(path="map_populate"), unittest.mock.patch(
++            "sglang.srt.mem_cache.storage.mmap.mmap_allocator._has_madv_populate_write",
++            return_value=False,
++        ):
++            mm = _mmap_prefaulted(-1, alloc_bytes, flags)
++            try:
++                self._assert_resident(mm, alloc_bytes)
++            finally:
++                mm.close()
++
+     def test_shm_host_tensor_allocator(self):
+         allocator = ShmHostTensorAllocator()
+         dims = (2, 512)
+-- 
+2.34.1
+

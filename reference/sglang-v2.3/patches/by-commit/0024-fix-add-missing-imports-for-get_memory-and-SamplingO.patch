@@ -1,0 +1,33 @@
+From 86c03c7cd28eb0b4e506c4727fd47a94c376c03c Mon Sep 17 00:00:00 2001
+From: root <root@MyComputer.localdomain>
+Date: Mon, 31 Aug 2026 04:33:31 +0800
+Subject: [PATCH 24/38] fix: add missing imports for get_memory and
+ SamplingObserver from #36911
+
+---
+ python/sglang/srt/model_executor/model_runner.py | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+index b8c697c6ad..a52e662e3d 100644
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -172,6 +172,7 @@ from sglang.srt.runtime_context import (
+     get_exec,
+     get_global_dwdp_manager,
+     get_lora,
++    get_memory,
+     get_model,
+     get_parallel,
+     get_schedule,
+@@ -181,6 +182,7 @@ from sglang.srt.runtime_context import (
+     remote_instance_transfer_engine_enabled,
+     set_global_dwdp_manager,
+ )
++from sglang.srt.sampling.sampling_observer import SamplingObserver
+ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+ from sglang.srt.server_args import (  # noqa: F401  (re-export)
+     CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS,
+-- 
+2.34.1
+

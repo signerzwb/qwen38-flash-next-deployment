@@ -1,0 +1,26 @@
+From 56ba4afb0dd4079648b0cfcf64a239077fe14014 Mon Sep 17 00:00:00 2001
+From: Shiyang Chen <cctry@meta.com>
+Date: Sat, 29 Aug 2026 16:57:43 -0700
+Subject: [PATCH 23/38] Fix full CUDA graph backend test fixture
+
+---
+ .../runner_backend/test_full_cuda_graph_backend.py             | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/test/registered/unit/model_executor/runner_backend/test_full_cuda_graph_backend.py b/test/registered/unit/model_executor/runner_backend/test_full_cuda_graph_backend.py
+index 4987bce1f5..4a25e37d11 100644
+--- a/test/registered/unit/model_executor/runner_backend/test_full_cuda_graph_backend.py
++++ b/test/registered/unit/model_executor/runner_backend/test_full_cuda_graph_backend.py
+@@ -56,6 +56,9 @@ def _make_backend(runner):
+     backend._outputs = {}
+     backend._pool = None
+     backend._capture_stream = None
++    backend._precarve = SimpleNamespace(
++        measure=contextlib.nullcontext, mint=mock.Mock()
++    )
+     backend._memory_saver_adapter = None
+     backend._cuda_graph_runner = runner
+     backend._device_module = runner.device_module
+-- 
+2.34.1
+

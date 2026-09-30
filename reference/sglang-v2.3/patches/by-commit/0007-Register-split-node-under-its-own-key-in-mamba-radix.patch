@@ -1,0 +1,245 @@
+From 2c65c59e789887fe6f43acb9e0e44b70802a964f Mon Sep 17 00:00:00 2001
+From: root <root@MyComputer.localdomain>
+Date: Sat, 29 Aug 2026 16:28:33 +0800
+Subject: [PATCH 07/38] Register split node under its own key in mamba radix
+ cache (PR #36696)
+
+_split_node filed the new intermediate node under the PRE-split key while
+giving it the POST-split key, so _delete_leaf/_delete_tombstone_leaf
+(which look up by node.key.child_key) missed whenever split_len <
+page_size, leaving an unremovable node that crashes eviction with
+"parent does not have child key, ()". Register under new_node.key.
+
+Plus split_len>0 guard, tree-wide child-key sanity check, and regression
+test.
+---
+ .../sglang/srt/mem_cache/mamba_radix_cache.py |  41 ++++-
+ .../mem_cache/test_mamba_radix_child_key.py   | 150 ++++++++++++++++++
+ 2 files changed, 190 insertions(+), 1 deletion(-)
+ create mode 100644 test/registered/unit/mem_cache/test_mamba_radix_child_key.py
+
+diff --git a/python/sglang/srt/mem_cache/mamba_radix_cache.py b/python/sglang/srt/mem_cache/mamba_radix_cache.py
+index a5afb89d41..1ec4b486f9 100644
+--- a/python/sglang/srt/mem_cache/mamba_radix_cache.py
++++ b/python/sglang/srt/mem_cache/mamba_radix_cache.py
+@@ -984,6 +984,29 @@ class MambaRadixCache(BasePrefixCache):
+             return
+         self.full_lru_list.sanity_check(self)
+         self.mamba_lru_list.sanity_check(self)
++        if _MAMBA_DEBUG_ASSERTS:
++            self._sanity_check_child_keys()
++
++    def _sanity_check_child_keys(self) -> None:
++        """Every node must be reachable under the slot its own key derives.
++
++        `_delete_leaf` / `_delete_tombstone_leaf` remove a node with
++        `parent.children.pop(node.key.child_key(page_size))`, so a node filed under
++        any other slot can never be removed: the pop misses, the assert fires far
++        from the write that caused it, and until then the node leaks its KV. Checked
++        here so a drift is attributed to the operation that introduced it.
++        """
++        stack = [self.root_node]
++        while stack:
++            node = stack.pop()
++            for slot, child in node.children.items():
++                expected = child.key.child_key(self.page_size)
++                assert slot == expected, (
++                    f"child registered under a slot its key does not derive: "
++                    f"{slot=}, {expected=}, {child.id=}, {node.id=}, "
++                    f"{len(child.key)=}, {self.page_size=}"
++                )
++                stack.append(child)
+ 
+     def evictable_size(self) -> Tuple[int, int]:
+         # Note: use full_evictable_size() and mamba_evictable_size() instead.
+@@ -1207,6 +1230,17 @@ class MambaRadixCache(BasePrefixCache):
+         )
+ 
+     def _split_node(self, key: RadixKey, child: TreeNode, split_len: int) -> TreeNode:
++        # A split must consume at least one full page. `match()` rounds down to a
++        # page multiple, so a caller that only splits when the child's first page
++        # already matched can never land here with 0 -- and a 0 would build a
++        # node whose key is empty, which `child_key()` renders as `()` for
++        # page_size > 1 instead of raising. Such a node is unfindable in its
++        # parent's `children` and only surfaces much later, as an eviction-time
++        # "parent does not have child key, ()". Fail at the corruption instead.
++        assert split_len > 0, (
++            f"_split_node with split_len=0 would create an empty-key node, "
++            f"{child.id=}, {len(child.key)=}, {self.page_size=}"
++        )
+         # new_node -> child
+         new_node = TreeNode()
+         new_node.children = {key[split_len:].child_key(self.page_size): child}
+@@ -1227,7 +1261,12 @@ class MambaRadixCache(BasePrefixCache):
+         child.parent = new_node
+         child.key = child.key[split_len:]
+         child.value = child.value[split_len:].clone()
+-        new_node.parent.children[key.child_key(self.page_size)] = new_node
++        # Register under the node's OWN key: `_delete_leaf` / `_delete_tombstone_leaf`
++        # look the node up with `node.key.child_key(...)`, so deriving the slot from
++        # anything else (here: the pre-split `key`) lets the two drift apart whenever
++        # `split_len < page_size`, leaving a node that can never be removed. Equal to
++        # `key.child_key(...)` in the healthy `split_len >= page_size` case.
++        new_node.parent.children[new_node.key.child_key(self.page_size)] = new_node
+         new_node.hash_value, child.hash_value = split_node_hash_value(
+             child.hash_value, split_len, self.page_size
+         )
+diff --git a/test/registered/unit/mem_cache/test_mamba_radix_child_key.py b/test/registered/unit/mem_cache/test_mamba_radix_child_key.py
+new file mode 100644
+index 0000000000..64540d8f01
+--- /dev/null
++++ b/test/registered/unit/mem_cache/test_mamba_radix_child_key.py
+@@ -0,0 +1,150 @@
++"""Child-slot bookkeeping of MambaRadixCache._split_node.
++
++Regression for an eviction-time crash on Ling-3.0-Flash (hybrid KDA + radix cache,
++page_size > 1): `AssertionError: parent does not have child key, ()` raised from
++`_delete_tombstone_leaf` during `alloc_req_slots -> evict -> evict_mamba`.
++
++A node is filed in `parent.children` under a slot computed at registration, but
++removed with a slot recomputed from `node.key`. `_split_node` used to register the
++new intermediate node under the *pre-split* key while giving it the *post-split*
++(truncated) key, so the two agree only when `split_len >= page_size`. Below that the
++node becomes unremovable; at `split_len == 0` its key is empty and `child_key()`
++renders it as `()` -- the exact crash signature.
++"""
++
++import unittest
++from array import array
++
++from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache, TreeNode
++from sglang.srt.mem_cache.radix_cache import RadixKey
++from sglang.test.ci.ci_register import register_cpu_ci
++
++register_cpu_ci(est_time=5, suite="base-a-test-cpu")
++
++PAGE_SIZE = 64
++
++
++def _bare_cache(page_size: int = PAGE_SIZE) -> MambaRadixCache:
++    """A MambaRadixCache with only what the split/delete bookkeeping touches.
++
++    __init__ builds GPU pools, so bypass it: these paths read `page_size` and the
++    tree, nothing else.
++    """
++    cache = MambaRadixCache.__new__(MambaRadixCache)
++    cache.page_size = page_size
++    cache.disable = False
++    cache.full_evictable_size_ = 0
++    cache.mamba_evictable_size_ = 0
++    cache.root_node = TreeNode()
++    cache.root_node.key = RadixKey(array("q"), None)
++    cache.root_node.value = None
++    return cache
++
++
++def _key(start: int, n: int) -> RadixKey:
++    return RadixKey(array("q", range(start, start + n)), None)
++
++
++class TestMambaRadixChildKey(unittest.TestCase):
++    def _split_and_get(self, split_len: int):
++        """Split a child at `split_len`; return (cache, new_node)."""
++        cache = _bare_cache()
++        child = TreeNode()
++        child.key = _key(1000, 3 * PAGE_SIZE)
++        child.parent = cache.root_node
++        child.full_lock_ref = 0
++        cache.root_node.children[child.key.child_key(PAGE_SIZE)] = child
++
++        # _split_node touches the LRU lists and hash helpers; stub them out so the
++        # test isolates the children-slot bookkeeping.
++        cache.full_lru_list = _NoopLru()
++        cache.mamba_lru_list = _NoopLru()
++        child.value = _FakeValue(3 * PAGE_SIZE)
++        child.hash_value = []
++        child.event_hash_value = []
++
++        new_node = cache._split_node(child.key, child, split_len)
++        return cache, new_node
++
++    def test_registered_slot_matches_node_key_when_page_aligned(self):
++        """Healthy path: a page-aligned split stays consistent."""
++        for split_len in (PAGE_SIZE, 2 * PAGE_SIZE):
++            with self.subTest(split_len=split_len):
++                cache, new_node = self._split_and_get(split_len)
++                slot = next(
++                    k for k, v in cache.root_node.children.items() if v is new_node
++                )
++                self.assertEqual(slot, new_node.key.child_key(PAGE_SIZE))
++
++    def test_sub_page_split_stays_removable(self):
++        """The bug: a sub-page split filed the node under a slot its key never derives.
++
++        Pre-fix the registered slot came from the pre-split key, so this lookup --
++        the one `_delete_tombstone_leaf` performs -- missed and the node could never
++        be removed.
++        """
++        cache, new_node = self._split_and_get(PAGE_SIZE // 2)
++        slot = next(k for k, v in cache.root_node.children.items() if v is new_node)
++        self.assertEqual(
++            slot,
++            new_node.key.child_key(PAGE_SIZE),
++            "node is filed under a slot its own key does not derive; "
++            "_delete_tombstone_leaf would raise 'parent does not have child key'",
++        )
++        # And the removal itself must find it.
++        popped = cache.root_node.children.pop(new_node.key.child_key(PAGE_SIZE), None)
++        self.assertIs(popped, new_node)
++
++    def test_zero_split_is_rejected(self):
++        """split_len == 0 builds an empty-key node, whose slot renders as `()`.
++
++        `child_key()` returns `()` for an empty key at page_size > 1 rather than
++        raising, so without this guard the corruption is silent until eviction.
++        """
++        with self.assertRaises(AssertionError):
++            self._split_and_get(0)
++
++    def test_sanity_check_detects_a_drifted_slot(self):
++        """The tree-wide invariant catches a mis-filed node directly."""
++        cache = _bare_cache()
++        child = TreeNode()
++        child.key = _key(2000, 2 * PAGE_SIZE)
++        child.parent = cache.root_node
++        cache.root_node.children[("wrong", "slot")] = child
++
++        with self.assertRaises(AssertionError):
++            cache._sanity_check_child_keys()
++
++
++class _NoopLru:
++    def remove_node(self, node):
++        pass
++
++    def insert_mru(self, node):
++        pass
++
++    def reset_node_mru(self, node):
++        pass
++
++
++class _FakeValue:
++    """Stands in for the kv-index tensor: only slicing and len are exercised."""
++
++    def __init__(self, n: int, offset: int = 0):
++        self.n = n
++        self.offset = offset
++
++    def __len__(self):
++        return self.n
++
++    def __getitem__(self, s):
++        start = s.start or 0
++        stop = self.n if s.stop is None else min(s.stop, self.n)
++        return _FakeValue(max(0, stop - start), self.offset + start)
++
++    def clone(self):
++        return _FakeValue(self.n, self.offset)
++
++
++if __name__ == "__main__":
++    unittest.main()
+-- 
+2.34.1
+

@@ -1,0 +1,867 @@
+From 3eb4bbe2c3cd82759eeb805d397e2a12dcef3c1f Mon Sep 17 00:00:00 2001
+From: cctry <csycfl@gmail.com>
+Date: Fri, 28 Aug 2026 13:35:12 -0700
+Subject: [PATCH 21/38] [Memory] Size the CUDA graph pool from warmup
+ measurements and fix graph-pool borrowing
+
+---
+ python/sglang/srt/cuda_vmm_utils.py           |  31 +++-
+ python/sglang/srt/environ.py                  |   3 +
+ python/sglang/srt/managers/scheduler.py       |   7 +
+ .../sglang/srt/model_executor/model_runner.py |  17 +-
+ .../breakable_cuda_graph_backend.py           |   6 +-
+ .../runner_backend/full_cuda_graph_backend.py |   6 +-
+ .../srt/model_executor/runner_utils/pool.py   |  67 ++++++--
+ .../srt/speculative/base_spec_worker.py       |   8 +-
+ python/sglang/srt/speculative/eagle_utils.py  | 145 ++++++++----------
+ .../test_startup_weight_load.py               |  72 ++++++++-
+ .../runner_utils/test_graph_pool_borrow.py    | 116 ++++++++++----
+ 11 files changed, 341 insertions(+), 137 deletions(-)
+
+diff --git a/python/sglang/srt/cuda_vmm_utils.py b/python/sglang/srt/cuda_vmm_utils.py
+index b0d873e2f9..6e1f562834 100644
+--- a/python/sglang/srt/cuda_vmm_utils.py
++++ b/python/sglang/srt/cuda_vmm_utils.py
+@@ -358,6 +358,7 @@ static size_t g_cursors[BUMPARENA_MAX_EXTENTS];
+ static size_t g_num_extents = 0;
+ static size_t g_freed_bytes = 0;
+ static size_t g_align = 512;
++static int g_best_fit = 0;
+ static std::mutex g_mu;
+ static size_t align_up(size_t v, size_t a){{ return (v + a - 1) / a * a; }}
+ void bumparena_set_extents_{sfx}(const uintptr_t* bases, const size_t* sizes, size_t n){{
+@@ -372,6 +373,7 @@ void bumparena_set_extents_{sfx}(const uintptr_t* bases, const size_t* sizes, si
+   }}
+ }}
+ void bumparena_set_align_{sfx}(size_t a){{ std::lock_guard<std::mutex> lk(g_mu); if (a) g_align=a; }}
++void bumparena_set_best_fit_{sfx}(int on){{ std::lock_guard<std::mutex> lk(g_mu); g_best_fit = on; }}
+ size_t bumparena_cursor_{sfx}(void){{
+   std::lock_guard<std::mutex> lk(g_mu);
+   size_t total = 0;
+@@ -380,14 +382,21 @@ size_t bumparena_cursor_{sfx}(void){{
+ }}
+ void* bumparena_malloc_{sfx}(size_t size, int device, void* stream){{
+   std::lock_guard<std::mutex> lk(g_mu);
++  size_t need = align_up(size, g_align);
++  size_t pick = BUMPARENA_MAX_EXTENTS;
+   for (size_t i = 0; i < g_num_extents; ++i) {{
+-    size_t need = g_cursors[i] + align_up(size, g_align);
+-    if (need > g_reserved[i]) continue;
+-    void* p = reinterpret_cast<void*>(g_bases[i] + g_cursors[i]);
+-    g_cursors[i] = need;
+-    return p;
++    size_t avail = g_reserved[i] - g_cursors[i];
++    if (avail < need) continue;
++    // First fit is for callers that map physical pages at the offsets they
++    // are handed, so extent order is theirs to choose.
++    if (!g_best_fit) {{ pick = i; break; }}
++    if (pick == BUMPARENA_MAX_EXTENTS ||
++        avail < g_reserved[pick] - g_cursors[pick]) pick = i;
+   }}
+-  return 0;   // no extent fits -- surfaces as an allocator OOM
++  if (pick == BUMPARENA_MAX_EXTENTS) return 0;   // no extent fits -- surfaces as an allocator OOM
++  void* p = reinterpret_cast<void*>(g_bases[pick] + g_cursors[pick]);
++  g_cursors[pick] += need;
++  return p;
+ }}
+ size_t bumparena_freed_{sfx}(void){{ std::lock_guard<std::mutex> lk(g_mu); return g_freed_bytes; }}
+ void bumparena_free_{sfx}(void* ptr, size_t size, int device, void* stream){{
+@@ -401,8 +410,8 @@ void bumparena_free_{sfx}(void* ptr, size_t size, int device, void* stream){{
+ class BumpArenaStub:
+     """JIT-built pluggable bump allocator over caller-provided device VA extents.
+ 
+-    ``malloc`` first-fits an extent and hands out ``base + cursor``; ``free``
+-    is a no-op. Plain ``torch.empty`` can thus be placed on externally managed
++    ``malloc`` picks an extent and hands out ``base + cursor``; ``free`` is a
++    no-op. Plain ``torch.empty`` can thus be placed on externally managed
+     storage by wrapping ``allocator`` in a ``torch.cuda.MemPool``.
+     ``set_extents`` re-points the arena and resets every cursor, letting one
+     stub serve successive region sets.
+@@ -462,6 +471,9 @@ class BumpArenaStub:
+         self._fn_set_align = lib[f"bumparena_set_align_{self.sfx}"]
+         self._fn_set_align.argtypes = [ctypes.c_size_t]
+         self._fn_set_align.restype = None
++        self._fn_set_best_fit = lib[f"bumparena_set_best_fit_{self.sfx}"]
++        self._fn_set_best_fit.argtypes = [ctypes.c_int]
++        self._fn_set_best_fit.restype = None
+         self._fn_cursor = lib[f"bumparena_cursor_{self.sfx}"]
+         self._fn_cursor.argtypes = []
+         self._fn_cursor.restype = ctypes.c_size_t
+@@ -486,6 +498,9 @@ class BumpArenaStub:
+     def set_align(self, nbytes: int) -> None:
+         self._fn_set_align(ctypes.c_size_t(nbytes))
+ 
++    def set_best_fit(self, on: bool) -> None:
++        self._fn_set_best_fit(ctypes.c_int(1 if on else 0))
++
+     @property
+     def cursor_bytes(self) -> int:
+         return int(self._fn_cursor())
+diff --git a/python/sglang/srt/environ.py b/python/sglang/srt/environ.py
+index c8e8bc2461..d65092b9da 100644
+--- a/python/sglang/srt/environ.py
++++ b/python/sglang/srt/environ.py
+@@ -1193,6 +1193,9 @@ class Envs:
+     SGLANG_MEMORY_SAVER_CUDA_GRAPH = EnvBool(False)
+     # Reuse wholly-free graph-pool segments for step-local eager allocations.
+     SGLANG_ENABLE_GRAPH_POOL_BORROW = EnvBool(False)
++    # Mint capture's measured footprint as one span so the graph pool is carved
++    # out of a single contiguous region instead of grown segment by segment.
++    SGLANG_ENABLE_GRAPH_POOL_PRECARVE = EnvBool(False)
+     # Eager forward wraps the ForwardBatch's own tensors instead of copying them
+     # into the CUDA graph buffer registry (no per-iter device-to-device copy).
+     SGLANG_EAGER_INPUT_NO_COPY = EnvBool(False)
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index 32bbb08ab8..693664760d 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -1012,6 +1012,13 @@ class Scheduler(
+         self.init_all_cuda_graphs()
+ 
+         model_runner = self.tp_worker.model_runner
++        with torch.get_device_module(model_runner.device).stream(
++            model_runner.forward_stream
++        ):
++            if self.draft_worker is None:
++                model_runner.prewarm_sampling()
++            else:
++                self.draft_worker.prewarm_sampling()
+         if model_runner.token_to_kv_pool.post_capture_active:
+             tic = time.perf_counter()
+             model_runner.post_capture_resize_kv_pool()
+diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+index 017198c76a..b8c697c6ad 100644
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -244,6 +244,14 @@ elif current_platform.is_out_of_tree():
+ logger = logging.getLogger(__name__)
+ 
+ 
++@dataclass(frozen=True)
++class SamplingPrewarmResult:
++    """Memory requirements observed while pre-warming a sampling path."""
++
++    sampling_input_bytes: int = 0
++    sampling_headroom_bytes: int = 0
++
++
+ def _prefill_cuda_graph_allows_context_parallel(
+     prefill_runner, forward_batch: ForwardBatch
+ ) -> bool:
+@@ -351,7 +359,9 @@ class ModelRunner:
+         self._pending_elastic_scale_update = None
+         self.init_new_workspace = False
+         self.draft_model_idx = draft_model_idx
+-        self.enable_hisparse = server_args.enable_hisparse
++        self.enable_hisparse = get_memory().enable_hisparse
++        self._sampling_observer: Optional[SamplingObserver] = None
++        self.sampling_prewarm_result = SamplingPrewarmResult()
+ 
+         self.init_startup_observability()
+ 
+@@ -981,6 +991,11 @@ class ModelRunner:
+             n_prepared,
+         )
+ 
++    def prewarm_sampling(self) -> SamplingPrewarmResult:
++        """Warm the sampling path after graph initialization."""
++        self.sampling_prewarm_result = SamplingPrewarmResult()
++        return self.sampling_prewarm_result
++
+     def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
+         capture = capture_cuda_graphs(
+             model_runner=self, capture_decode_cuda_graph=capture_decode_cuda_graph
+diff --git a/python/sglang/srt/model_executor/runner_backend/breakable_cuda_graph_backend.py b/python/sglang/srt/model_executor/runner_backend/breakable_cuda_graph_backend.py
+index f12bef0284..d4da89192f 100644
+--- a/python/sglang/srt/model_executor/runner_backend/breakable_cuda_graph_backend.py
++++ b/python/sglang/srt/model_executor/runner_backend/breakable_cuda_graph_backend.py
+@@ -40,6 +40,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import
+     enable_breakable_cuda_graph,
+ )
+ from sglang.srt.model_executor.runner_utils.pool import (
++    GraphPoolPrecarve,
+     get_or_create_global_graph_memory_pool,
+     graph_pool_capture_scope,
+     graph_pool_replay_scope,
+@@ -77,6 +78,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
+         self._capture_stream: Optional[torch.cuda.Stream] = None
+         self._debug_eager = debug_eager
+         self._shared_output_buffer: Optional[Any] = None
++        self._precarve = GraphPoolPrecarve()
+         self._memory_saver_adapter: Optional[Any] = TorchMemorySaverAdapter.create(
+             enable=enable_memory_saver
+             and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
+@@ -117,7 +119,8 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
+         for _ in range(2):
+             self._device_module.synchronize()
+             self._tp_group.barrier()
+-            warmup_out = forward_fn()
++            with self._precarve.measure():
++                warmup_out = forward_fn()
+             if post_warmup_hook is not None:
+                 post_warmup_hook()
+ 
+@@ -134,6 +137,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
+             stream=self._capture_stream,
+             barrier_fn=self._tp_group.barrier,
+         ):
++            self._precarve.mint()
+             out = captured_fn()
+             out_rows = self._output_rows(out, size)
+             self._copy_output_to_buffer(out, self._shared_output_buffer, out_rows)
+diff --git a/python/sglang/srt/model_executor/runner_backend/full_cuda_graph_backend.py b/python/sglang/srt/model_executor/runner_backend/full_cuda_graph_backend.py
+index aa5b9f3db4..691d41cc3b 100644
+--- a/python/sglang/srt/model_executor/runner_backend/full_cuda_graph_backend.py
++++ b/python/sglang/srt/model_executor/runner_backend/full_cuda_graph_backend.py
+@@ -31,6 +31,7 @@ from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
+     BaseCudaGraphBackend,
+ )
+ from sglang.srt.model_executor.runner_utils.pool import (
++    GraphPoolPrecarve,
+     get_or_create_global_graph_memory_pool,
+     graph_pool_capture_scope,
+     graph_pool_replay_scope,
+@@ -64,6 +65,7 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
+         self._device_module = cuda_graph_runner.device_module
+         self._tp_group = cuda_graph_runner.model_runner.tp_group
+         self._capture_stream: Optional[torch.cuda.Stream] = None
++        self._precarve = GraphPoolPrecarve()
+         self._memory_saver_adapter: Optional[Any] = TorchMemorySaverAdapter.create(
+             enable=enable_memory_saver
+             and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
+@@ -107,7 +109,8 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
+         for _ in range(2):
+             self._device_module.synchronize()
+             self._tp_group.barrier()
+-            forward_fn()
++            with self._precarve.measure():
++                forward_fn()
+             if profiler is not None:
+                 profiler.step()
+             if post_warmup_hook is not None:
+@@ -131,6 +134,7 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
+             graph_pool_capture_scope(),
+             graph_ctx(cuda_graph=graph, pool=self._pool, stream=self._capture_stream),
+         ):
++            self._precarve.mint()
+             out = forward_fn()
+ 
+         if profiler is not None:
+diff --git a/python/sglang/srt/model_executor/runner_utils/pool.py b/python/sglang/srt/model_executor/runner_utils/pool.py
+index 7dd64dc8fa..7d96759839 100644
+--- a/python/sglang/srt/model_executor/runner_utils/pool.py
++++ b/python/sglang/srt/model_executor/runner_utils/pool.py
+@@ -43,6 +43,7 @@ def disable_graph_pool_borrow(reason: str) -> None:
+     """Disable borrowing when graph storage is managed outside the shared pool."""
+     global _borrow_disabled_reason
+     _borrow_disabled_reason = reason
++    _teardown_borrow_pool()
+     logger.info("Graph pool borrow disabled: %s", reason)
+ 
+ 
+@@ -81,6 +82,52 @@ def get_or_create_global_graph_memory_pool(device_module: Any) -> Any:
+     return resources.graph_memory_pool
+ 
+ 
++def get_or_create_global_graph_capture_stream() -> Any:
++    """Return the shared graph capture stream, creating it on first use so every
++    capture pass reserves the pool's scratch once instead of per stream.
++
++    CUDA only — the NPU / XPU / CPU graph runners keep their own streams.
++    """
++    return get_stream(_CAPTURE_STREAM_NAME)
++
++
++class GraphPoolPrecarve:
++    """Pre-carve the memory pool to reduce fragmentation."""
++
++    def __init__(self) -> None:
++        self.nbytes = 0
++        self.minted = False
++
++    @contextmanager
++    def measure(self) -> Iterator[None]:
++        """Wrap one eager warmup. the last one before ``mint`` sets the size."""
++        if self.minted or not envs.SGLANG_ENABLE_GRAPH_POOL_PRECARVE.get():
++            yield
++            return
++        torch.cuda.synchronize()
++        # Shrink the cache first so the warmup's reserved growth is its own
++        # footprint. Reserved (not allocated) is the stat to use: allocated
++        # peak is the live-byte sum and undershoots by exactly the packing
++        # holes the carved span has to absorb.
++        torch.cuda.empty_cache()
++        torch.cuda.reset_peak_memory_stats()
++        base = torch.cuda.memory_stats()["reserved_bytes.all.current"]
++        yield
++        torch.cuda.synchronize()
++        self.nbytes = torch.cuda.memory_stats()["reserved_bytes.all.peak"] - base
++
++    def mint(self) -> None:
++        """Pre-allocate the space"""
++        if self.minted:
++            return
++        self.minted = True
++        if self.nbytes <= 0:
++            return
++        span = torch.empty(self.nbytes, dtype=torch.uint8, device="cuda")
++        del span
++        logger.info("Graph pool pre-carved: %.2f GB", self.nbytes / 2**30)
++
++
+ def graph_pool_borrow_enabled() -> bool:
+     if (
+         _borrow_disabled_reason is not None
+@@ -131,11 +178,11 @@ def graph_pool_capture_scope() -> Iterator[None]:
+ 
+ 
+ def find_free_graph_pool_runs(pool_id: Any) -> list[tuple[int, int]]:
+-    """Return contiguous inactive runs inside wholly-free segments, largest first."""
++    """Return contiguous inactive runs across all pool segments, largest first;
++    live and pending-free blocks break runs, so a run never overlaps live data.
++    """
+     runs: list[tuple[int, int]] = []
+     for segment in torch.cuda.memory_snapshot(pool_id, include_traces=False):
+-        if segment["allocated_size"] != 0:
+-            continue
+         run_address = 0
+         run_bytes = 0
+         for block in segment["blocks"]:
+@@ -183,16 +230,18 @@ def borrow_graph_pool(user: str) -> Iterator[None]:
+             # Return completed cross-stream frees to the cache. The allocator
+             # processes their events on a later allocation.
+             torch.empty(1, device="cuda")
+-            if (
+-                _borrow_stub.freed_bytes
+-                or _borrow_stub.cursor_bytes > _borrow_extents_total // 2
+-            ):
+-                # Rebuild if empty_cache released the arena's segments or if
+-                # unresolved deferred frees consumed half of the extents.
++            if _borrow_stub.freed_bytes:
++                # Rebuild if the caching allocator released an arena segment.
++                # A high cursor alone means the cache owns reusable segments;
++                # rebuilding discards them and can turn the next large borrow
++                # into a fragmented cold-allocation OOM.
+                 _teardown_borrow_pool()
+         if _borrow_mem_pool is None:
+             if _borrow_stub is None:
+                 _borrow_stub = BumpArenaStub()
++                # Runs are sorted largest first, so first fit would carve every
++                # small allocation out of the run a probability matrix needs.
++                _borrow_stub.set_best_fit(True)
+             if _borrow_static_runs is not None:
+                 runs = _borrow_static_runs
+             else:
+diff --git a/python/sglang/srt/speculative/base_spec_worker.py b/python/sglang/srt/speculative/base_spec_worker.py
+index ba0ffd616e..2a268f81e5 100644
+--- a/python/sglang/srt/speculative/base_spec_worker.py
++++ b/python/sglang/srt/speculative/base_spec_worker.py
+@@ -19,7 +19,10 @@ if TYPE_CHECKING:
+         UpdateWeightsFromIPCReqInput,
+     )
+     from sglang.srt.managers.tp_worker import TpModelWorker
+-    from sglang.srt.model_executor.model_runner import ModelRunner
++    from sglang.srt.model_executor.model_runner import (
++        ModelRunner,
++        SamplingPrewarmResult,
++    )
+     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+ 
+ 
+@@ -211,6 +214,9 @@ class BaseSpecWorker(ABC):
+             return 0.0
+         return self.draft_worker.weight_load_time
+ 
++    def prewarm_sampling(self) -> SamplingPrewarmResult:
++        return self.target_worker.model_runner.prewarm_sampling()
++
+     @property
+     def last_shared_read_runner(self):
+         # The runner that runs the step's LAST shared-buffer-reading phase --
+diff --git a/python/sglang/srt/speculative/eagle_utils.py b/python/sglang/srt/speculative/eagle_utils.py
+index 28cf4610c7..4591528939 100644
+--- a/python/sglang/srt/speculative/eagle_utils.py
++++ b/python/sglang/srt/speculative/eagle_utils.py
+@@ -19,7 +19,6 @@ from sglang.srt.mem_cache.allocation_sizing import (
+     get_alloc_reserve_per_decode,
+     page_aligned_decode_alloc_lens,
+ )
+-from sglang.srt.model_executor.runner_utils.pool import borrow_graph_pool
+ from sglang.srt.runtime_context import get_parallel, get_spec
+ from sglang.srt.utils import (
+     is_cpu,
+@@ -775,87 +774,79 @@ def eagle_sample(
+             else tree_speculative_sampling_target_only
+         )
+ 
+-        # These full-vocabulary matrices are consumed by the sampling kernel
+-        # within this step. Returned tensors were allocated before the scope,
+-        # so the next CUDA graph replay may safely reclaim these borrowed bytes.
+-        with borrow_graph_pool(user="EAGLE probability borrow"):
+-            expanded_temperature = torch.repeat_interleave(
+-                sampling_info.temperatures, verify_input.draft_token_num, dim=0
+-            )  # (bs * num_draft_tokens, 1)
++        expanded_temperature = torch.repeat_interleave(
++            sampling_info.temperatures, verify_input.draft_token_num, dim=0
++        )  # (bs * num_draft_tokens, 1)
+ 
+-            target_probs = F.softmax(
+-                next_token_logits / expanded_temperature, dim=-1
++        target_probs = F.softmax(
++            next_token_logits / expanded_temperature, dim=-1
++        )  # (bs * num_draft_tokens, vocab_size)
++        maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
++        if sampling_info.need_top_k_sampling:
++            target_probs = top_k_renorm_prob(
++                target_probs,
++                torch.repeat_interleave(
++                    sampling_info.top_ks, verify_input.draft_token_num, dim=0
++                ),
+             )  # (bs * num_draft_tokens, vocab_size)
+-            maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
+-            if sampling_info.need_top_k_sampling:
+-                target_probs = top_k_renorm_prob(
+-                    target_probs,
+-                    torch.repeat_interleave(
+-                        sampling_info.top_ks, verify_input.draft_token_num, dim=0
+-                    ),
+-                )  # (bs * num_draft_tokens, vocab_size)
+-                maybe_detect_nan(
+-                    target_probs, "v2 verify: target_probs after top_k_renorm"
+-                )
+-            if sampling_info.need_top_p_sampling:
+-                target_probs = top_p_renorm_prob(
+-                    target_probs,
+-                    torch.repeat_interleave(
+-                        sampling_info.top_ps, verify_input.draft_token_num, dim=0
+-                    ),
+-                )
+-                maybe_detect_nan(
+-                    target_probs, "v2 verify: target_probs after top_p_renorm"
+-                )
+-            target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
+-            draft_probs = (
+-                verify_input.draft_probs
+-                if use_rejection_sampling
+-                else torch.zeros_like(target_probs)
+-            )
+-            # Defense-in-depth behind the spec_hook startup allowlist: validate
+-            # the actual kernel inputs before the Triton kernel.
+-            if use_rejection_sampling and (
+-                draft_probs is None or draft_probs.shape[-1] != target_probs.shape[-1]
+-            ):
+-                raise ValueError(
+-                    "Rejection sampling requires a target-vocab draft proposal "
+-                    "distribution; the current speculative algorithm/draft worker "
+-                    "does not produce one (draft_probs missing or vocab-mismatched)."
+-                )
+-
+-            coins, coins_for_final_sampling = _verify_coins(
+-                sampling_info=sampling_info,
+-                seq_lens=batch.seq_lens,
+-                draft_token_num=verify_input.draft_token_num,
+-                candidates=candidates,
+-                device=device,
+-            )
+-            sampling_fn(
+-                predicts=predict,  # mutable
+-                accept_index=accept_index,  # mutable
+-                accept_token_num=num_correct_drafts,  # mutable
+-                candidates=candidates,
+-                # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
+-                retrive_index=verify_input.retrieve_index,
+-                retrive_next_token=verify_input.retrieve_next_token,
+-                retrive_next_sibling=verify_input.retrieve_next_sibling,
+-                uniform_samples=coins,
+-                uniform_samples_for_final_sampling=coins_for_final_sampling,
+-                target_probs=target_probs,
+-                draft_probs=draft_probs,
+-                threshold_single=get_spec().speculative_accept_threshold_single,
+-                threshold_acc=get_spec().speculative_accept_threshold_acc,
+-                deterministic=True,
+-            )
+-            del (
+-                expanded_temperature,
++            maybe_detect_nan(target_probs, "v2 verify: target_probs after top_k_renorm")
++        if sampling_info.need_top_p_sampling:
++            target_probs = top_p_renorm_prob(
+                 target_probs,
+-                draft_probs,
+-                coins,
+-                coins_for_final_sampling,
++                torch.repeat_interleave(
++                    sampling_info.top_ps, verify_input.draft_token_num, dim=0
++                ),
++            )
++            maybe_detect_nan(target_probs, "v2 verify: target_probs after top_p_renorm")
++        target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
++        draft_probs = (
++            verify_input.draft_probs
++            if use_rejection_sampling
++            else torch.zeros_like(target_probs)
++        )
++        # Defense-in-depth behind the spec_hook startup allowlist: validate
++        # the actual kernel inputs before the Triton kernel.
++        if use_rejection_sampling and (
++            draft_probs is None or draft_probs.shape[-1] != target_probs.shape[-1]
++        ):
++            raise ValueError(
++                "Rejection sampling requires a target-vocab draft proposal "
++                "distribution; the current speculative algorithm/draft worker "
++                "does not produce one (draft_probs missing or vocab-mismatched)."
+             )
+ 
++        coins, coins_for_final_sampling = _verify_coins(
++            sampling_info=sampling_info,
++            seq_lens=batch.seq_lens,
++            draft_token_num=verify_input.draft_token_num,
++            candidates=candidates,
++            device=device,
++        )
++        sampling_fn(
++            predicts=predict,  # mutable
++            accept_index=accept_index,  # mutable
++            accept_token_num=num_correct_drafts,  # mutable
++            candidates=candidates,
++            # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
++            retrive_index=verify_input.retrieve_index,
++            retrive_next_token=verify_input.retrieve_next_token,
++            retrive_next_sibling=verify_input.retrieve_next_sibling,
++            uniform_samples=coins,
++            uniform_samples_for_final_sampling=coins_for_final_sampling,
++            target_probs=target_probs,
++            draft_probs=draft_probs,
++            threshold_single=get_spec().speculative_accept_threshold_single,
++            threshold_acc=get_spec().speculative_accept_threshold_acc,
++            deterministic=True,
++        )
++        del (
++            expanded_temperature,
++            target_probs,
++            draft_probs,
++            coins,
++            coins_for_final_sampling,
++        )
++
+         # Sync sampling results across TP ranks: different GPUs may
+         # produce slightly different target_probs due to floating-point
+         # non-determinism in softmax/top_k/top_p, causing different
+diff --git a/test/registered/unit/model_executor/model_runner_components/test_startup_weight_load.py b/test/registered/unit/model_executor/model_runner_components/test_startup_weight_load.py
+index ba5a924dc0..aaeb519b5c 100644
+--- a/test/registered/unit/model_executor/model_runner_components/test_startup_weight_load.py
++++ b/test/registered/unit/model_executor/model_runner_components/test_startup_weight_load.py
+@@ -675,6 +675,9 @@ class _SchedulerWorker:
+     def __init__(self, trace, *, post_capture_active=False):
+         self._trace = trace
+         self.model_runner = SimpleNamespace(
++            device="cuda",
++            forward_stream=object(),
++            prewarm_sampling=lambda: trace.append("prewarm"),
+             token_to_kv_pool=SimpleNamespace(post_capture_active=post_capture_active),
+             post_capture_resize_kv_pool=lambda: trace.append("resize"),
+         )
+@@ -688,7 +691,7 @@ class _SchedulerWorker:
+ 
+ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
+     @staticmethod
+-    def _scheduler(worker, trace, *, mode):
++    def _scheduler(worker, trace, *, mode, draft_worker=None):
+         from sglang.srt.managers.scheduler import Scheduler
+ 
+         scheduler = Scheduler.__new__(Scheduler)
+@@ -697,17 +700,38 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
+         )
+         scheduler.init_tp_model_worker = lambda: setattr(scheduler, "tp_worker", worker)
+         scheduler.maybe_init_draft_worker = lambda: setattr(
+-            scheduler, "draft_worker", None
++            scheduler, "draft_worker", draft_worker
+         )
+         scheduler.init_memory_pools = lambda: trace.append("memory_pool")
+         scheduler.init_all_attention_backends = lambda: trace.append("attention")
+         scheduler.init_all_cuda_graphs = lambda: trace.append("capture")
+         return scheduler
+ 
+-    def _run_startup(self, mode):
++    def _run_startup(self, mode, *, use_draft_worker=False):
+         trace = []
+         worker = _SchedulerWorker(trace, post_capture_active=True)
+-        scheduler = self._scheduler(worker, trace, mode=mode)
++        draft_worker = (
++            SimpleNamespace(prewarm_sampling=lambda: trace.append("draft_prewarm"))
++            if use_draft_worker
++            else None
++        )
++        scheduler = self._scheduler(
++            worker,
++            trace,
++            mode=mode,
++            draft_worker=draft_worker,
++        )
++
++        class StreamContext:
++            def __enter__(self):
++                trace.append("stream_enter")
++
++            def __exit__(self, *_args):
++                trace.append("stream_exit")
++
++        def stream_context(stream):
++            self.assertIs(stream, worker.model_runner.forward_stream)
++            return StreamContext()
+ 
+         def stop_after_startup():
+             raise RuntimeError("stop after startup")
+@@ -724,6 +748,10 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
+                     )
+                 ),
+             ),
++            patch(
++                "sglang.srt.managers.scheduler.torch.get_device_module",
++                return_value=SimpleNamespace(stream=stream_context),
++            ),
+             self.assertRaisesRegex(RuntimeError, "stop after startup"),
+         ):
+             scheduler.init_model_worker()
+@@ -733,13 +761,45 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
+     def test_serial_path_skips_overlap_hooks(self):
+         self.assertEqual(
+             self._run_startup("serial"),
+-            ["memory_pool", "attention", "capture", "resize"],
++            [
++                "memory_pool",
++                "attention",
++                "capture",
++                "stream_enter",
++                "prewarm",
++                "stream_exit",
++                "resize",
++            ],
+         )
+ 
+     def test_overlap_starts_before_capture_and_finalizes_after(self):
+         self.assertEqual(
+             self._run_startup("overlap"),
+-            ["start", "memory_pool", "attention", "capture", "resize", "finalize"],
++            [
++                "start",
++                "memory_pool",
++                "attention",
++                "capture",
++                "stream_enter",
++                "prewarm",
++                "stream_exit",
++                "resize",
++                "finalize",
++            ],
++        )
++
++    def test_draft_worker_prewarm_uses_target_forward_stream(self):
++        self.assertEqual(
++            self._run_startup("serial", use_draft_worker=True),
++            [
++                "memory_pool",
++                "attention",
++                "capture",
++                "stream_enter",
++                "draft_prewarm",
++                "stream_exit",
++                "resize",
++            ],
+         )
+ 
+ 
+diff --git a/test/registered/unit/model_executor/runner_utils/test_graph_pool_borrow.py b/test/registered/unit/model_executor/runner_utils/test_graph_pool_borrow.py
+index 56f6f97c50..45918f534d 100644
+--- a/test/registered/unit/model_executor/runner_utils/test_graph_pool_borrow.py
++++ b/test/registered/unit/model_executor/runner_utils/test_graph_pool_borrow.py
+@@ -1,7 +1,6 @@
+ """CUDA graph-pool borrowing allocator and lifetime regression tests."""
+ 
+ import unittest
+-from contextlib import contextmanager
+ from types import SimpleNamespace
+ from unittest.mock import MagicMock, Mock, patch
+ 
+@@ -43,6 +42,25 @@ class TestGraphPoolBorrow(CustomTestCase):
+         pool._borrow_extents_total = 0
+         pool._largest_logged_graph_pool_borrow = 0
+ 
++    def test_mixed_segment_runs_exclude_live_blocks(self):
++        """A mixed segment's free runs are borrowable, but a returned run must
++        never overlap the live block — overlap would silently corrupt
++        graph-owned data instead of raising an OOM."""
++        snapshot = [
++            {
++                "allocated_size": 4096,
++                "total_size": 3 * 4096,
++                "blocks": [
++                    {"state": "inactive", "address": 0x1000, "size": 4096},
++                    {"state": "active_allocated", "address": 0x2000, "size": 4096},
++                    {"state": "inactive", "address": 0x3000, "size": 4096},
++                ],
++            }
++        ]
++        with patch.object(pool.torch.cuda, "memory_snapshot", return_value=snapshot):
++            runs = pool.find_free_graph_pool_runs((0, 1))
++        self.assertEqual(sorted(runs), [(0x1000, 4096), (0x3000, 4096)])
++
+     def test_graph_replay_fails_during_active_pool_borrow(self):
+         graph = Mock()
+         backend = object.__new__(FullCudaGraphBackend)
+@@ -74,6 +92,24 @@ class TestGraphPoolBorrow(CustomTestCase):
+ 
+         graph.replay.assert_not_called()
+ 
++    def test_high_cursor_keeps_reusable_cached_segments(self):
++        stub = MagicMock(cursor_bytes=600, freed_bytes=0)
++        mem_pool = MagicMock()
++
++        with (
++            patch.object(pool, "graph_pool_borrow_enabled", return_value=True),
++            patch.object(pool, "_borrow_stub", stub),
++            patch.object(pool, "_borrow_mem_pool", mem_pool),
++            patch.object(pool, "_borrow_extents_total", 1000),
++            patch.object(pool, "_teardown_borrow_pool") as teardown,
++            patch.object(pool.torch, "empty"),
++            patch.object(pool.torch.cuda, "use_mem_pool"),
++        ):
++            with pool.borrow_graph_pool(user="test"):
++                pass
++
++        teardown.assert_not_called()
++
+     def test_external_graph_storage_can_disable_borrowing(self):
+         with (
+             envs.SGLANG_ENABLE_GRAPH_POOL_BORROW.override(True),
+@@ -84,29 +120,8 @@ class TestGraphPoolBorrow(CustomTestCase):
+             pool.disable_graph_pool_borrow("graph storage is externally managed")
+             self.assertFalse(pool.graph_pool_borrow_enabled())
+ 
+-    def test_eagle_non_greedy_probabilities_use_borrow_scope(self):
+-        state = {"active": False, "users": []}
+-
+-        @contextmanager
+-        def tracking_borrow(*, user):
+-            self.assertFalse(state["active"])
+-            state["active"] = True
+-            state["users"].append(user)
+-            try:
+-                yield
+-            finally:
+-                state["active"] = False
+-
+-        import torch.nn.functional as F
+-
+-        real_softmax = F.softmax
+-
+-        def checked_softmax(*args, **kwargs):
+-            self.assertTrue(state["active"])
+-            return real_softmax(*args, **kwargs)
+-
++    def test_eagle_non_greedy_probabilities_do_not_borrow_graph_pool(self):
+         def fake_sampling(**kwargs):
+-            self.assertTrue(state["active"])
+             kwargs["predicts"].fill_(3)
+             kwargs["accept_index"].fill_(0)
+             kwargs["accept_token_num"].fill_(1)
+@@ -146,9 +161,8 @@ class TestGraphPoolBorrow(CustomTestCase):
+         tp_group = SimpleNamespace(world_size=1)
+ 
+         with (
+-            patch.object(eagle_utils, "borrow_graph_pool", tracking_borrow),
++            patch.object(pool, "borrow_graph_pool") as borrow_graph_pool,
+             patch.object(eagle_utils, "get_spec", return_value=spec_config),
+-            patch("torch.nn.functional.softmax", side_effect=checked_softmax),
+             patch(
+                 "sglang.srt.layers.dp_attention.is_dp_attention_enabled",
+                 return_value=False,
+@@ -163,8 +177,7 @@ class TestGraphPoolBorrow(CustomTestCase):
+                 verify_input, batch, logits_output
+             )
+ 
+-        self.assertEqual(state["users"], ["EAGLE probability borrow"])
+-        self.assertFalse(state["active"])
++        borrow_graph_pool.assert_not_called()
+         self.assertTrue(torch.equal(predict, torch.full_like(predict, 3)))
+         self.assertTrue(torch.equal(accept_lens, torch.full_like(accept_lens, 2)))
+         self.assertTrue(torch.equal(accept_index, torch.zeros_like(accept_index)))
+@@ -176,8 +189,9 @@ class TestGraphPoolBorrow(CustomTestCase):
+         graph = torch.cuda.CUDAGraph()
+         x = torch.zeros(8, device="cuda")
+         stream = torch.cuda.Stream()
+-        with torch.cuda.stream(stream), torch.cuda.graph(
+-            graph, pool=handle, stream=stream
++        with (
++            torch.cuda.stream(stream),
++            torch.cuda.graph(graph, pool=handle, stream=stream),
+         ):
+             # Two capture-only transients become disjoint free graph-pool runs.
+             transient_a = torch.empty(48 << 20, dtype=torch.uint8, device="cuda")
+@@ -237,8 +251,9 @@ class TestGraphPoolBorrow(CustomTestCase):
+         graph = torch.cuda.CUDAGraph()
+         x = torch.zeros(8, device="cuda")
+         stream = torch.cuda.Stream()
+-        with torch.cuda.stream(stream), torch.cuda.graph(
+-            graph, pool=handle, stream=stream
++        with (
++            torch.cuda.stream(stream),
++            torch.cuda.graph(graph, pool=handle, stream=stream),
+         ):
+             transient = torch.empty(64 << 20, dtype=torch.uint8, device="cuda")
+             y = x + 1
+@@ -267,6 +282,40 @@ class TestGraphPoolBorrow(CustomTestCase):
+ 
+         del graph, y
+ 
++    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
++    def test_oversized_borrow_raises_oom_then_regular_allocation_succeeds(self):
++        handle = torch.cuda.graph_pool_handle()
++        graph = torch.cuda.CUDAGraph()
++        x = torch.zeros(8, device="cuda")
++        stream = torch.cuda.Stream()
++        with (
++            torch.cuda.stream(stream),
++            torch.cuda.graph(graph, pool=handle, stream=stream),
++        ):
++            transient = torch.empty(64 << 20, dtype=torch.uint8, device="cuda")
++            y = x + 1
++            del transient
++        torch.cuda.synchronize()
++
++        runs = pool.find_free_graph_pool_runs(handle)
++        address, run_bytes = next(run for run in runs if run[1] >= 16 << 20)
++        with (
++            envs.SGLANG_ENABLE_GRAPH_POOL_BORROW.override(True),
++            patch.object(pool, "get_global_graph_memory_pool", return_value=None),
++        ):
++            pool.set_graph_pool_borrow_runs([(address, 8 << 20)])
++            with self.assertRaises(torch.OutOfMemoryError):
++                with pool.borrow_graph_pool(user="undersized-test"):
++                    torch.empty(16 << 20, dtype=torch.uint8, device="cuda")
++
++            pool.disable_graph_pool_borrow("undersized test pool")
++            regular = torch.empty(16 << 20, dtype=torch.uint8, device="cuda")
++            self.assertEqual(regular.nbytes, 16 << 20)
++            del regular
++
++        self.assertGreaterEqual(run_bytes, 16 << 20)
++        del graph, y
++
+     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+     def test_cross_stream_borrow_frees_resolve_before_pointer_reuse(self):
+         """Deferred record_stream frees must not collide on the next borrow."""
+@@ -274,8 +323,9 @@ class TestGraphPoolBorrow(CustomTestCase):
+         graph = torch.cuda.CUDAGraph()
+         x = torch.zeros(8, device="cuda")
+         stream = torch.cuda.Stream()
+-        with torch.cuda.stream(stream), torch.cuda.graph(
+-            graph, pool=handle, stream=stream
++        with (
++            torch.cuda.stream(stream),
++            torch.cuda.graph(graph, pool=handle, stream=stream),
+         ):
+             transient = torch.empty(128 << 20, dtype=torch.uint8, device="cuda")
+             y = x + 1
+-- 
+2.34.1
+

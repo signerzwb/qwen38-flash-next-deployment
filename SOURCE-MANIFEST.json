@@ -1,0 +1,18 @@
+{
+  "source_filename": "Qwen3.8 flash next-部署文档包-20260930.zip",
+  "source_sha256": "d3856053cf73d9c8cd58554c32a5aa6c414c1adf6ea955c2758c7ce24f4b9520",
+  "sanitized_bundle": "downloads/qwen38-deployment-package-20260930-sanitized.zip",
+  "sanitized_sha256": "2e508dea9ceb9e6fb62857ca24fb8cc9e83b888fef22658f49229948c6de23f0",
+  "credentials_replaced": 1,
+  "changed_archive_entries": [
+    "source/config/run-sglang-qwen38-fp8.sh",
+    "source/config/run-sglang-qwen38-v23.sh",
+    "source/config/strata-iq3_s.json",
+    "source/参考原始包/3080双卡-sglang部署建议.zip/3080 双卡 qwen3.827b sglang部署建议/测速脚本/bm27.py",
+    "source/参考原始包/3080双卡-sglang部署建议.zip/3080 双卡 qwen3.827b sglang部署建议/测速脚本/bm8780.py",
+    "source/参考原始包/3080双卡-sglang部署建议.zip/3080 双卡 qwen3.827b sglang部署建议/测速脚本/coldp.py",
+    "source/参考原始包/3080双卡-sglang部署建议.zip/3080 双卡 qwen3.827b sglang部署建议/测速脚本/coldreal.py",
+    "source/参考原始包/3080双卡-sglang部署建议.zip/3080 双卡 qwen3.827b sglang部署建议/测速脚本/vcheck.py"
+  ],
+  "policy": "Archive preserved except credential removal, UTF-8 normalization and ZIP path normalization; no scripts executed."
+}

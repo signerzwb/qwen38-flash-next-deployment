@@ -1,0 +1,41 @@
+From 0d02788fcddb623c6ed33495bf89a86267238cd6 Mon Sep 17 00:00:00 2001
+From: root <root@MyComputer.localdomain>
+Date: Sat, 29 Aug 2026 22:03:55 +0800
+Subject: [PATCH 11/38] fix(metrics): prefill log floor applies to tail chunks
+ too
+
+Health-check / tiny requests slipped through via the tail-chunk path.
+Middle chunks are now skipped by extend_range.end < origin length; the
+floor check applies uniformly.
+---
+ .../scheduler_components/metrics_reporter.py         | 12 ++++++------
+ 1 file changed, 6 insertions(+), 6 deletions(-)
+
+diff --git a/python/sglang/srt/managers/scheduler_components/metrics_reporter.py b/python/sglang/srt/managers/scheduler_components/metrics_reporter.py
+index 143543f6f2..bb59ea8a33 100644
+--- a/python/sglang/srt/managers/scheduler_components/metrics_reporter.py
++++ b/python/sglang/srt/managers/scheduler_components/metrics_reporter.py
+@@ -664,14 +664,14 @@ class SchedulerMetricsReporter:
+                     _floor = 4096
+                 for _req in batch.reqs:
+                     _new_tok = _req.extend_range.length if _req.extend_range else 0
+-                    # chunked-prefill continuation chunks: only log the first
+-                    # chunk (large), skip middles, log the tail chunk. The tail
+-                    # is identified by extend_range.end reaching the full input.
+-                    _is_tail = (
++                    # Chunked prefill: skip middle chunks (extend_range.end has
++                    # not reached full input), log first + tail chunks. Middles
++                    # are identified by extending beyond the origin input len.
++                    _is_middle = (
+                         _req.extend_range is not None
+-                        and _req.extend_range.end >= len(_req.origin_input_ids)
++                        and _req.extend_range.end < len(_req.origin_input_ids)
+                     )
+-                    if _new_tok < _floor and not _is_tail:
++                    if _is_middle or _new_tok < _floor:
+                         continue
+                     _hit_dev = len(_req.prefix_indices)
+                     _hit_host = _req.host_hit_length or 0
+-- 
+2.34.1
+

@@ -1,0 +1,56 @@
+From e4cfca2e141a2311ffadb9b4874852fbdab2a137 Mon Sep 17 00:00:00 2001
+From: root <root@MyComputer.localdomain>
+Date: Sat, 29 Aug 2026 22:00:16 +0800
+Subject: [PATCH 10/38] perf(metrics): per-request prefill attribution log
+
+PREFILL-REQ lines tie cache-miss re-prefill events to a caller rid:
+new tokens, device/host hit lengths, full input length. Requests below
+SGLANG_PREFILL_LOG_MIN_TOKENS (default 4096) stay silent; chunked
+prefill logs first and tail chunks only.
+---
+ .../scheduler_components/metrics_reporter.py  | 29 +++++++++++++++++++
+ 1 file changed, 29 insertions(+)
+
+diff --git a/python/sglang/srt/managers/scheduler_components/metrics_reporter.py b/python/sglang/srt/managers/scheduler_components/metrics_reporter.py
+index b6a12ca662..143543f6f2 100644
+--- a/python/sglang/srt/managers/scheduler_components/metrics_reporter.py
++++ b/python/sglang/srt/managers/scheduler_components/metrics_reporter.py
+@@ -651,6 +651,35 @@ class SchedulerMetricsReporter:
+ 
+         if self.is_stats_logging_rank:
+             logger.info(msg)
++            # Per-request prefill attribution: one line per sizeable request so
++            # cache-miss events can be tied to a caller. Small requests (hook
++            # bursts etc.) stay silent to avoid log flooding; tune the floor
++            # with SGLANG_PREFILL_LOG_MIN_TOKENS (0 = log every request).
++            if batch is not None and batch.forward_mode.is_extend():
++                import os as _os
++                _floor = _os.environ.get('SGLANG_PREFILL_LOG_MIN_TOKENS', '4096')
++                try:
++                    _floor = int(_floor)
++                except ValueError:
++                    _floor = 4096
++                for _req in batch.reqs:
++                    _new_tok = _req.extend_range.length if _req.extend_range else 0
++                    # chunked-prefill continuation chunks: only log the first
++                    # chunk (large), skip middles, log the tail chunk. The tail
++                    # is identified by extend_range.end reaching the full input.
++                    _is_tail = (
++                        _req.extend_range is not None
++                        and _req.extend_range.end >= len(_req.origin_input_ids)
++                    )
++                    if _new_tok < _floor and not _is_tail:
++                        continue
++                    _hit_dev = len(_req.prefix_indices)
++                    _hit_host = _req.host_hit_length or 0
++                    logger.info(
++                        'PREFILL-REQ rid=%s new=%d hit_device=%d hit_host=%d input=%d',
++                        _req.rid, _new_tok, _hit_dev, _hit_host,
++                        len(_req.origin_input_ids),
++                    )
+         if self.current_scheduler_metrics_enabled:
+             self.metrics_collector.increment_prefill_cuda_graph_pass(
+                 value=can_run_cuda_graph
+-- 
+2.34.1
+

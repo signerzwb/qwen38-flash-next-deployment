@@ -1,0 +1,451 @@
+From 6708b161b5b70e91a30ca932a2cca2e43e786164 Mon Sep 17 00:00:00 2001
+From: charlesxu91 <charlesxu.mi@gmail.com>
+Date: Sat, 29 Aug 2026 19:24:55 +0800
+Subject: [PATCH 20/38] [BugFix] Preserve chunked prefill progress without
+ radix insert
+
+---
+ .../sglang/srt/mem_cache/base_prefix_cache.py |   2 +-
+ python/sglang/srt/mem_cache/chunk_cache.py    |   4 +-
+ python/sglang/srt/mem_cache/common.py         |   9 +-
+ .../sglang/srt/mem_cache/mamba_radix_cache.py |   6 +-
+ .../srt/mem_cache/pure_swa_radix_cache.py     |   4 +-
+ python/sglang/srt/mem_cache/radix_cache.py    |  12 +-
+ .../sglang/srt/mem_cache/radix_cache_cpp.py   |  16 ++-
+ .../sglang/srt/mem_cache/swa_radix_cache.py   |   6 +-
+ .../srt/mem_cache/unified_radix_cache.py      |  14 ++-
+ .../mem_cache/test_radix_cache_cpp_unit.py    |  64 ++++++++--
+ .../mem_cache/test_skip_radix_cache_insert.py | 118 ++++++++++++++++++
+ 11 files changed, 229 insertions(+), 26 deletions(-)
+ create mode 100644 test/registered/unit/mem_cache/test_skip_radix_cache_insert.py
+
+diff --git a/python/sglang/srt/mem_cache/base_prefix_cache.py b/python/sglang/srt/mem_cache/base_prefix_cache.py
+index abc840cdae..33542ec6fe 100644
+--- a/python/sglang/srt/mem_cache/base_prefix_cache.py
++++ b/python/sglang/srt/mem_cache/base_prefix_cache.py
+@@ -317,7 +317,7 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
+         pass
+ 
+     @abstractmethod
+-    def cache_unfinished_req(self, req: Req, **kwargs):
++    def cache_unfinished_req(self, req: Req, is_insert: bool = True, **kwargs):
+         pass
+ 
+     @abstractmethod
+diff --git a/python/sglang/srt/mem_cache/chunk_cache.py b/python/sglang/srt/mem_cache/chunk_cache.py
+index 51b365b3d6..95de4c620b 100644
+--- a/python/sglang/srt/mem_cache/chunk_cache.py
++++ b/python/sglang/srt/mem_cache/chunk_cache.py
+@@ -86,7 +86,9 @@ class ChunkCache(BasePrefixCache):
+         ]
+         self.token_to_kv_pool_allocator.free(kv_indices)
+ 
+-    def cache_unfinished_req(self, req: Req, chunked=False):
++    def cache_unfinished_req(
++        self, req: Req, chunked: bool = False, is_insert: bool = True
++    ):
+         kv_indices = self.req_to_token_pool.req_to_token[
+             req.req_pool_idx, : req.extend_range.end
+         ]
+diff --git a/python/sglang/srt/mem_cache/common.py b/python/sglang/srt/mem_cache/common.py
+index 4bc61811b8..64492fbfda 100644
+--- a/python/sglang/srt/mem_cache/common.py
++++ b/python/sglang/srt/mem_cache/common.py
+@@ -105,10 +105,11 @@ def free_swa_out_of_window_slots(
+ 
+ 
+ def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
+-    if getattr(req, "skip_radix_cache_insert", False):
+-        return
+-
+-    tree_cache.cache_unfinished_req(req, **kwargs)
++    tree_cache.cache_unfinished_req(
++        req,
++        is_insert=not getattr(req, "skip_radix_cache_insert", False),
++        **kwargs,
++    )
+ 
+ 
+ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
+diff --git a/python/sglang/srt/mem_cache/mamba_radix_cache.py b/python/sglang/srt/mem_cache/mamba_radix_cache.py
+index 1ec4b486f9..e722c5286e 100644
+--- a/python/sglang/srt/mem_cache/mamba_radix_cache.py
++++ b/python/sglang/srt/mem_cache/mamba_radix_cache.py
+@@ -672,7 +672,9 @@ class MambaRadixCache(BasePrefixCache):
+ 
+         self.dec_lock_ref(req.last_node)
+ 
+-    def cache_unfinished_req(self, req: Req, chunked=False) -> None:
++    def cache_unfinished_req(
++        self, req: Req, chunked: bool = False, is_insert: bool = True
++    ) -> None:
+         """Cache request when it is unfinished."""
+ 
+         def _skip_cache_unfinished_req(req: Req) -> None:
+@@ -690,7 +692,7 @@ class MambaRadixCache(BasePrefixCache):
+             if self.enable_mamba_extra_buffer
+             else len(token_ids)
+         )
+-        if self.disable or cache_len is None:
++        if not is_insert or self.disable or cache_len is None:
+             return _skip_cache_unfinished_req(req)
+ 
+         kv_indices_orig = self.req_to_token_pool.req_to_token[
+diff --git a/python/sglang/srt/mem_cache/pure_swa_radix_cache.py b/python/sglang/srt/mem_cache/pure_swa_radix_cache.py
+index 938e8b5a6f..d45bd45078 100644
+--- a/python/sglang/srt/mem_cache/pure_swa_radix_cache.py
++++ b/python/sglang/srt/mem_cache/pure_swa_radix_cache.py
+@@ -138,10 +138,10 @@ class PureSWARadixCache(RadixCache):
+         if req.last_node is not None:
+             self.dec_lock_ref(req.last_node)
+ 
+-    def cache_unfinished_req(self, req: Req, chunked=False):
++    def cache_unfinished_req(self, req: Req, chunked=False, is_insert: bool = True):
+         """During chunked prefill, swa_evicted_seqlen is 0 and no SWA eviction
+         has happened yet, so standard RadixCache logic is correct."""
+-        super().cache_unfinished_req(req, chunked=chunked)
++        super().cache_unfinished_req(req, chunked=chunked, is_insert=is_insert)
+ 
+     def available_and_evictable_str(self) -> str:
+         allocator = self.token_to_kv_pool_allocator
+diff --git a/python/sglang/srt/mem_cache/radix_cache.py b/python/sglang/srt/mem_cache/radix_cache.py
+index 60ec95137e..2f34b119f9 100644
+--- a/python/sglang/srt/mem_cache/radix_cache.py
++++ b/python/sglang/srt/mem_cache/radix_cache.py
+@@ -513,7 +513,9 @@ class RadixCache(BasePrefixCache):
+         if req.last_node is not None:
+             self.dec_lock_ref(req.last_node)
+ 
+-    def cache_unfinished_req(self, req: Req, chunked=False):
++    def cache_unfinished_req(
++        self, req: Req, chunked: bool = False, is_insert: bool = True
++    ):
+         """Cache request when it is unfinished."""
+         if self.disable:
+             return
+@@ -523,6 +525,14 @@ class RadixCache(BasePrefixCache):
+             req.req_pool_idx, : len(token_ids)
+         ]
+ 
++        if not is_insert:
++            # Keep chunked-prefill progress request-owned without publishing it
++            # to the radix tree. cache_protected_len intentionally remains at
++            # the previously matched tree prefix so cache_finished_req can free
++            # this request-owned range when it finishes.
++            req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
++            return
++
+         radix_key = RadixKey(
+             token_ids,
+             req.extra_key,
+diff --git a/python/sglang/srt/mem_cache/radix_cache_cpp.py b/python/sglang/srt/mem_cache/radix_cache_cpp.py
+index 46d4c67749..610bce2f3b 100644
+--- a/python/sglang/srt/mem_cache/radix_cache_cpp.py
++++ b/python/sglang/srt/mem_cache/radix_cache_cpp.py
+@@ -190,7 +190,12 @@ class RadixCacheCpp(BasePrefixCache):
+ 
+         # NOTE: our C++ implementation don't need `token_ids` and `kv_indices` to be page-aligned
+         # it will automatically align them, but length of them should be equal
+-        old_prefix_len = len(req.prefix_indices) // self.page_size * self.page_size
++        if is_insert:
++            old_prefix_len = len(req.prefix_indices) // self.page_size * self.page_size
++        else:
++            # Skipped unfinished inserts advance prefix_indices for scheduling,
++            # but cache_protected_len remains the tree-owned boundary.
++            old_prefix_len = req.cache_protected_len
+         page_aligned_overall_len = kv_len_to_handle // self.page_size * self.page_size
+ 
+         if is_insert:
+@@ -217,7 +222,7 @@ class RadixCacheCpp(BasePrefixCache):
+         # Remove req slot release the cache lock
+         self.dec_lock_ref(req.last_node)
+ 
+-    def cache_unfinished_req(self, req: Req, chunked=False):
++    def cache_unfinished_req(self, req: Req, chunked=False, is_insert: bool = True):
+         """Cache request when it is unfinished."""
+         self._reject_cache_salt(req.cache_salt)
+         assert req.req_pool_idx is not None
+@@ -227,6 +232,13 @@ class RadixCacheCpp(BasePrefixCache):
+             req.req_pool_idx, :prefill_len
+         ].to(dtype=torch.int64, copy=True)
+ 
++        if not is_insert:
++            # Keep chunked-prefill progress request-owned without publishing it
++            # to the C++ radix tree. cache_finished_req later frees everything
++            # after cache_protected_len.
++            req.prefix_indices = kv_indices
++            return
++
+         # NOTE: our C++ implementation don't need `token_ids` and `kv_indices` to be page-aligned
+         # it will automatically align them, but length of them should be equal
+         old_prefix_len = len(req.prefix_indices) // self.page_size * self.page_size
+diff --git a/python/sglang/srt/mem_cache/swa_radix_cache.py b/python/sglang/srt/mem_cache/swa_radix_cache.py
+index 4ecbd68b28..d8a56f898e 100644
+--- a/python/sglang/srt/mem_cache/swa_radix_cache.py
++++ b/python/sglang/srt/mem_cache/swa_radix_cache.py
+@@ -512,9 +512,11 @@ class SWARadixCache(BasePrefixCache):
+         )
+         req.swa_prefix_lock_released = False
+ 
+-    def cache_unfinished_req(self, req: Req, chunked=False) -> None:
++    def cache_unfinished_req(
++        self, req: Req, chunked=False, is_insert: bool = True
++    ) -> None:
+         """Cache request when it is unfinished."""
+-        if self.disable:
++        if not is_insert or self.disable:
+             kv_indices = self.req_to_token_pool.req_to_token[
+                 req.req_pool_idx, : req.extend_range.end
+             ]
+diff --git a/python/sglang/srt/mem_cache/unified_radix_cache.py b/python/sglang/srt/mem_cache/unified_radix_cache.py
+index cfaf3eea61..46eb669074 100644
+--- a/python/sglang/srt/mem_cache/unified_radix_cache.py
++++ b/python/sglang/srt/mem_cache/unified_radix_cache.py
+@@ -822,13 +822,21 @@ class UnifiedRadixCache(BasePrefixCache):
+             ):
+                 self.session_refs.register_session_ref(req)
+ 
+-    def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
+-        if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
++    def cache_unfinished_req(
++        self,
++        req: Req,
++        chunked: bool = False,
++        is_insert: bool = True,
++        **kwargs,
++    ) -> None:
++        if self.session.try_cache_unfinished_req(
++            req, chunked=chunked, is_insert=is_insert, **kwargs
++        ):
+             return
+ 
+         token_ids = req.get_fill_ids()
+ 
+-        if self.disable:
++        if not is_insert or self.disable:
+             kv_indices = self.req_to_token_pool.req_to_token[
+                 req.req_pool_idx, : len(token_ids)
+             ]
+diff --git a/test/registered/unit/mem_cache/test_radix_cache_cpp_unit.py b/test/registered/unit/mem_cache/test_radix_cache_cpp_unit.py
+index 48d204d586..b0fde3769a 100644
+--- a/test/registered/unit/mem_cache/test_radix_cache_cpp_unit.py
++++ b/test/registered/unit/mem_cache/test_radix_cache_cpp_unit.py
+@@ -1,10 +1,15 @@
+-"""Unit tests for fail-closed C++ radix-cache request validation."""
++"""Unit tests for C++ radix-cache request handling."""
+ 
+ import importlib
+ import sys
+ import types
+ import unittest
+-from unittest.mock import patch
++from array import array
++from contextlib import contextmanager
++from types import SimpleNamespace
++from unittest.mock import MagicMock, patch
++
++import torch
+ 
+ from sglang.test.ci.ci_register import register_cpu_ci
+ from sglang.test.test_utils import CustomTestCase
+@@ -12,8 +17,9 @@ from sglang.test.test_utils import CustomTestCase
+ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+ 
+ 
+-class TestRadixCacheCppCacheSalt(CustomTestCase):
+-    def test_cache_salt_is_rejected_without_loading_cpp_extension(self):
++class TestRadixCacheCpp(CustomTestCase):
++    @contextmanager
++    def _import_with_fake_extension(self):
+         extension_name = "sglang.srt.mem_cache.cpp_radix_tree.radix_tree"
+         module_name = "sglang.srt.mem_cache.radix_cache_cpp"
+         fake_extension = types.ModuleType(extension_name)
+@@ -24,15 +30,57 @@ class TestRadixCacheCppCacheSalt(CustomTestCase):
+         original_module = sys.modules.pop(module_name, None)
+         try:
+             with patch.dict(sys.modules, {extension_name: fake_extension}):
+-                module = importlib.import_module(module_name)
+-                module.RadixCacheCpp._reject_cache_salt(None)
+-                with self.assertRaisesRegex(ValueError, "experimental C\\+\\+"):
+-                    module.RadixCacheCpp._reject_cache_salt("tenant-a")
++                yield importlib.import_module(module_name)
+         finally:
+             sys.modules.pop(module_name, None)
+             if original_module is not None:
+                 sys.modules[module_name] = original_module
+ 
++    def test_cache_salt_is_rejected_without_loading_cpp_extension(self):
++        with self._import_with_fake_extension() as module:
++            module.RadixCacheCpp._reject_cache_salt(None)
++            with self.assertRaisesRegex(ValueError, "experimental C\\+\\+"):
++                module.RadixCacheCpp._reject_cache_salt("tenant-a")
++
++    def test_skip_insert_keeps_progress_request_owned(self):
++        """Skipped publication must advance progress and free only request-owned KV."""
++        with self._import_with_fake_extension() as module:
++            kv_indices = torch.tensor([[401, 402, 403, 404, 405, 406]])
++            cache = module.RadixCacheCpp.__new__(module.RadixCacheCpp)
++            cache.page_size = 1
++            cache.req_to_token_pool = SimpleNamespace(req_to_token=kv_indices)
++            cache.token_to_kv_pool_allocator = MagicMock()
++            cache._insert = MagicMock()
++            cache.dec_lock_ref = MagicMock()
++
++            last_node = object()
++            req = SimpleNamespace(
++                cache_salt=None,
++                req_pool_idx=0,
++                prefix_indices=kv_indices[0, :2].clone(),
++                cache_protected_len=2,
++                origin_input_ids=array("q", [1, 2, 3, 4, 5, 6]),
++                output_ids=array("q"),
++                extra_key=None,
++                last_node=last_node,
++                get_fill_ids=lambda: array("q", [1, 2, 3, 4, 5, 6]),
++            )
++
++            cache.cache_unfinished_req(req, chunked=True, is_insert=False)
++
++            torch.testing.assert_close(req.prefix_indices, kv_indices[0])
++            self.assertEqual(req.cache_protected_len, 2)
++            cache._insert.assert_not_called()
++
++            cache.cache_finished_req(req, is_insert=False, kv_len_to_handle=6)
++
++            cache.token_to_kv_pool_allocator.free.assert_called_once()
++            torch.testing.assert_close(
++                cache.token_to_kv_pool_allocator.free.call_args.args[0],
++                kv_indices[0, 2:],
++            )
++            cache.dec_lock_ref.assert_called_once_with(last_node)
++
+ 
+ if __name__ == "__main__":
+     unittest.main()
+diff --git a/test/registered/unit/mem_cache/test_skip_radix_cache_insert.py b/test/registered/unit/mem_cache/test_skip_radix_cache_insert.py
+new file mode 100644
+index 0000000000..c0ffbbc64f
+--- /dev/null
++++ b/test/registered/unit/mem_cache/test_skip_radix_cache_insert.py
+@@ -0,0 +1,118 @@
++"""Regression coverage for chunked prefill with radix insertion disabled."""
++
++import unittest
++from array import array
++from types import SimpleNamespace
++from unittest.mock import MagicMock
++
++import torch
++
++from sglang.test.ci.ci_register import register_cpu_ci
++from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
++
++maybe_stub_sgl_kernel()
++
++from sglang.srt.mem_cache.common import maybe_cache_unfinished_req  # noqa: E402
++from sglang.srt.mem_cache.chunk_cache import ChunkCache  # noqa: E402
++from sglang.srt.mem_cache.pure_swa_radix_cache import (  # noqa: E402
++    PureSWARadixCache,
++)
++from sglang.srt.mem_cache.radix_cache import RadixCache  # noqa: E402
++from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache  # noqa: E402
++
++register_cpu_ci(est_time=3, suite="base-a-test-cpu")
++
++
++class TestSkipRadixCacheInsert(CustomTestCase):
++    def test_chunked_request_advances_without_inserting(self):
++        kv_indices = torch.tensor([[101, 102, 103, 104, 105, 106]])
++        cache = RadixCache.__new__(RadixCache)
++        cache.disable = False
++        cache.disable_finished_insert = False
++        cache.page_size = 1
++        cache.is_eagle = False
++        cache.req_to_token_pool = SimpleNamespace(req_to_token=kv_indices)
++        cache.token_to_kv_pool_allocator = MagicMock()
++        cache.insert = MagicMock()
++        cache.match_prefix = MagicMock()
++        cache.dec_lock_ref = MagicMock()
++        cache.inc_lock_ref = MagicMock()
++
++        last_node = object()
++        req = SimpleNamespace(
++            skip_radix_cache_insert=True,
++            req_pool_idx=0,
++            prefix_indices=kv_indices[0, :2].clone(),
++            cache_protected_len=2,
++            last_node=last_node,
++            origin_input_ids=array("q", [1, 2, 3, 4, 5, 6]),
++            output_ids=array("q"),
++            extra_key=None,
++            cache_salt=None,
++            get_fill_ids=lambda: array("q", [1, 2, 3, 4, 5, 6]),
++        )
++
++        maybe_cache_unfinished_req(req, cache, chunked=True)
++
++        torch.testing.assert_close(req.prefix_indices, kv_indices[0])
++        self.assertEqual(req.cache_protected_len, 2)
++        self.assertIs(req.last_node, last_node)
++        cache.insert.assert_not_called()
++        cache.match_prefix.assert_not_called()
++        cache.token_to_kv_pool_allocator.free_segment.assert_not_called()
++        cache.dec_lock_ref.assert_not_called()
++        cache.inc_lock_ref.assert_not_called()
++
++        cache.cache_finished_req(req, is_insert=False, kv_len_to_handle=6)
++
++        freed_segments = cache.token_to_kv_pool_allocator.free_segments.call_args.args[
++            0
++        ]
++        torch.testing.assert_close(freed_segments[0][0], kv_indices[0, 2:])
++        self.assertEqual(freed_segments[0][1], 2)
++        self.assertEqual(freed_segments[1][0].numel(), 0)
++        cache.dec_lock_ref.assert_called_once_with(last_node)
++
++    def test_chunk_cache_still_advances_with_skip_flag(self):
++        kv_indices = torch.tensor([[201, 202, 203, 204, 205, 206]])
++        cache = ChunkCache.__new__(ChunkCache)
++        cache.req_to_token_pool = SimpleNamespace(req_to_token=kv_indices)
++        req = SimpleNamespace(
++            skip_radix_cache_insert=True,
++            req_pool_idx=0,
++            prefix_indices=kv_indices[0, :2].clone(),
++            extend_range=SimpleNamespace(end=6),
++        )
++
++        maybe_cache_unfinished_req(req, cache, chunked=True)
++
++        torch.testing.assert_close(req.prefix_indices, kv_indices[0])
++
++    def test_swa_backends_advance_without_publishing(self):
++        """Skipping publication must still advance chunked-prefill ownership."""
++        kv_indices = torch.tensor([[301, 302, 303, 304, 305, 306]])
++
++        for cache_cls in (PureSWARadixCache, SWARadixCache):
++            with self.subTest(cache_cls=cache_cls.__name__):
++                cache = cache_cls.__new__(cache_cls)
++                cache.disable = False
++                cache.req_to_token_pool = SimpleNamespace(req_to_token=kv_indices)
++                cache.insert = MagicMock()
++                req = SimpleNamespace(
++                    skip_radix_cache_insert=True,
++                    req_pool_idx=0,
++                    prefix_indices=kv_indices[0, :2].clone(),
++                    cache_protected_len=2,
++                    extend_range=SimpleNamespace(end=6),
++                    get_fill_ids=lambda: array("q", [1, 2, 3, 4, 5, 6]),
++                )
++
++                maybe_cache_unfinished_req(req, cache, chunked=True)
++
++                torch.testing.assert_close(req.prefix_indices, kv_indices[0])
++                self.assertEqual(req.cache_protected_len, 2)
++                cache.insert.assert_not_called()
++
++
++if __name__ == "__main__":
++    unittest.main(verbosity=2)
+-- 
+2.34.1
+

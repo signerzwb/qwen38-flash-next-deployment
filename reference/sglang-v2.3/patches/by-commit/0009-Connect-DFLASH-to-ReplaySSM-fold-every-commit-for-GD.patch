@@ -1,0 +1,267 @@
+From 50bf829548b6211581fd7c3f32dec7b10f1cfed2 Mon Sep 17 00:00:00 2001
+From: root <root@MyComputer.localdomain>
+Date: Sat, 29 Aug 2026 17:08:39 +0800
+Subject: [PATCH 09/38] Connect DFLASH to ReplaySSM fold-every-commit for GDN
+ models (PR #36683, hand-ported)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+DFlash commit scatters intermediate_ssm snapshots that ReplaySSM mode no
+longer produces, so the guard in _build_hybrid_req_pool rejected GDN.
+Route the DFlash post-verify commit through the common
+commit_mamba_states_after_verify hook (fold-every-commit from the
+per-slot raw-input ring) when the pool has replayssm_spec_fold set; the
+legacy snapshot path stays for non-ReplaySSM runs. The guard now only
+rejects DSPARK+GDN on non-static ragged layouts.
+
+This frees the per-draft full-state snapshot scratch (~8G on 12-slot
+DFlash) at the cost of an fp32/bf16 fold per commit — accuracy A/B
+required before production (bf16 re-quantization drift).
+---
+ .../srt/mem_cache/kv_cache_configurator.py    | 23 +++--
+ .../srt/speculative/dflash_worker_v2.py       | 36 ++++++++
+ .../dspark_components/dspark_worker_v2.py     | 26 ++++++
+ .../unit/spec/test_dflash_overlap_hostsync.py | 89 +++++++++++++++++++
+ 4 files changed, 167 insertions(+), 7 deletions(-)
+
+diff --git a/python/sglang/srt/mem_cache/kv_cache_configurator.py b/python/sglang/srt/mem_cache/kv_cache_configurator.py
+index e92d34d6d4..be6d53e150 100644
+--- a/python/sglang/srt/mem_cache/kv_cache_configurator.py
++++ b/python/sglang/srt/mem_cache/kv_cache_configurator.py
+@@ -864,18 +864,27 @@ class KVCacheConfigurator:
+         max_num_reqs: int,
+         extra_max_context_len: int,
+     ) -> ReqToTokenPool:
+-        # DSPARK/DFLASH commit routes through the backend fold (KDA-only); a
+-        # non-KDA model there would scatter a None intermediate_ssm and crash.
++        # DFLASH and DSPARK route GDN ReplaySSM through the common
++        # fold-every-commit hook. DSPARK's compact/cap-accept layouts are ragged,
++        # while the GDN ring-write currently requires a dense fixed-width window.
+         _algo = (get_spec().speculative_algorithm or "").upper()
+         if (
+             get_exec().mamba.enable_linear_replayssm_spec
+-            and _algo in ("DSPARK", "DFLASH")
+-            and kimi_linear_config(self.model_config) is None
++            and _algo == "DSPARK"
++            and self.hybrid_gdn_config is not None
+         ):
+-            raise ValueError(
+-                "--enable-linear-replayssm-spec with DSPARK/DFLASH requires a KDA "
+-                "(kimi_linear) model; got a non-KDA model."
++            from sglang.srt.speculative.ragged_verify import (
++                RaggedVerifyMode,
++                read_ragged_verify_mode,
+             )
++
++            ragged_mode = read_ragged_verify_mode()
++            if ragged_mode is not RaggedVerifyMode.STATIC:
++                raise ValueError(
++                    "--enable-linear-replayssm-spec with DSPARK + GDN currently "
++                    "requires SGLANG_RAGGED_VERIFY_MODE=static; got "
++                    f"{ragged_mode.value!r}."
++                )
+         req_to_token_pool = HybridReqToTokenPool(
+             size=max_num_reqs,
+             mamba_size=get_schedule().max_mamba_cache_size,
+diff --git a/python/sglang/srt/speculative/dflash_worker_v2.py b/python/sglang/srt/speculative/dflash_worker_v2.py
+index 7ae69921b5..0b05e32094 100644
+--- a/python/sglang/srt/speculative/dflash_worker_v2.py
++++ b/python/sglang/srt/speculative/dflash_worker_v2.py
+@@ -63,6 +63,7 @@ from sglang.srt.speculative.spec_utils import (
+     GrammarTree,
+     assign_req_to_token_pool_func,
+     build_grammar_vocab_mask,
++    commit_mamba_states_after_verify,
+ )
+ from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_hip, is_npu
+ 
+@@ -1520,6 +1521,41 @@ class DFlashWorkerV2(BaseSpecWorker):
+         """
+         if not self._need_mamba_verify_commit:
+             return
++
++        bs = int(commit_lens.shape[0])
++        block_size = int(self.block_size)
++        req_pool = self.target_worker.model_runner.req_to_token_pool
++        mamba_pool = getattr(req_pool, "mamba_pool", None)
++        use_replayssm_commit = (
++            mamba_pool is not None
++            and (
++                getattr(mamba_pool, "replayssm_spec_fold", False)
++                or getattr(mamba_pool, "replayssm_cache_base", None) is not None
++            )
++            and not getattr(mamba_pool, "replayssm_is_kda", False)
++        )
++        if use_replayssm_commit:
++            offsets = torch.arange(
++                0,
++                bs * block_size,
++                step=block_size,
++                dtype=torch.int32,
++                device=commit_lens.device,
++            )
++            accept_index = offsets[:, None] + torch.arange(
++                block_size,
++                dtype=torch.int32,
++                device=commit_lens.device,
++            )
++            commit_mamba_states_after_verify(
++                target_worker=self.target_worker,
++                batch=batch,
++                accept_lens=commit_lens,
++                accept_index=accept_index,
++                draft_token_num=block_size,
++            )
++            return
++
+         attn_backend = self.target_worker.model_runner.attn_backend
+ 
+         last_correct_step_indices = commit_lens.to(torch.int64) - 1
+diff --git a/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py b/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
+index 666cfd8c0b..b0ad844c67 100644
+--- a/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
++++ b/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
+@@ -63,6 +63,7 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
+ from sglang.srt.speculative.spec_utils import (
+     GrammarTree,
+     build_grammar_vocab_mask,
++    commit_mamba_states_after_verify,
+     draft_tp_context,
+     prepare_mamba_track_for_verify,
+ )
+@@ -807,6 +808,31 @@ class DSparkWorkerV2(BaseSpecWorker):
+         # layout would need the accept-index mapping the shared spec_utils
+         # commit helper does.
+         assert get_spec().speculative_eagle_topk in (None, 1)
++
++        req_pool = self.target_worker.model_runner.req_to_token_pool
++        mamba_pool = getattr(req_pool, "mamba_pool", None)
++        use_gdn_replayssm_fold = (
++            mamba_pool is not None
++            and getattr(mamba_pool, "replayssm_spec_fold", False)
++            and not getattr(mamba_pool, "replayssm_is_kda", False)
++        )
++        if use_gdn_replayssm_fold:
++            bs = int(commit_lens.shape[0])
++            draft_token_num = int(self.verify_num_draft_tokens)
++            accept_index = torch.arange(
++                bs * draft_token_num,
++                dtype=commit_lens.dtype,
++                device=commit_lens.device,
++            ).view(bs, draft_token_num)
++            commit_mamba_states_after_verify(
++                target_worker=self.target_worker,
++                batch=batch,
++                accept_lens=commit_lens,
++                accept_index=accept_index,
++                draft_token_num=draft_token_num,
++            )
++            return
++
+         attn_backend = self.target_worker.model_runner.attn_backend
+ 
+         last_correct_step_indices = commit_lens.to(torch.int64) - 1
+diff --git a/test/registered/unit/spec/test_dflash_overlap_hostsync.py b/test/registered/unit/spec/test_dflash_overlap_hostsync.py
+index 96d9f834aa..3ea3b505af 100644
+--- a/test/registered/unit/spec/test_dflash_overlap_hostsync.py
++++ b/test/registered/unit/spec/test_dflash_overlap_hostsync.py
+@@ -60,6 +60,95 @@ class TestCompactSeqLensHostBound(CustomTestCase):
+         self.assertGreaterEqual(int(bound), int(exact_true))
+ 
+ 
++class TestDFlashMambaCommit(CustomTestCase):
++    def test_fold_replayssm_uses_common_mamba_commit_hook(self):
++        from sglang.srt.speculative import dflash_worker_v2
++        from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
++
++        calls = []
++
++        def fake_commit(**kwargs):
++            calls.append(kwargs)
++
++        old_commit = dflash_worker_v2.commit_mamba_states_after_verify
++        dflash_worker_v2.commit_mamba_states_after_verify = fake_commit
++        try:
++            worker = SimpleNamespace(
++                _need_mamba_verify_commit=True,
++                block_size=4,
++                target_worker=SimpleNamespace(
++                    model_runner=SimpleNamespace(
++                        req_to_token_pool=SimpleNamespace(
++                            mamba_pool=SimpleNamespace(
++                                replayssm_spec_fold=True,
++                                replayssm_is_kda=False,
++                            )
++                        )
++                    )
++                ),
++            )
++            batch = object()
++            commit_lens = torch.tensor([1, 3], dtype=torch.int32)
++            DFlashWorkerV2._update_target_mamba_state_after_verify(
++                worker,
++                batch=batch,
++                seq_lens_pre_verify=torch.tensor([10, 20], dtype=torch.int64),
++                commit_lens=commit_lens,
++            )
++        finally:
++            dflash_worker_v2.commit_mamba_states_after_verify = old_commit
++
++        self.assertEqual(len(calls), 1)
++        call = calls[0]
++        self.assertIs(call["target_worker"], worker.target_worker)
++        self.assertIs(call["batch"], batch)
++        self.assertIs(call["accept_lens"], commit_lens)
++        self.assertEqual(call["draft_token_num"], 4)
++        torch.testing.assert_close(
++            call["accept_index"],
++            torch.tensor([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=torch.int32),
++        )
++
++    def test_non_replayssm_keeps_legacy_mamba_commit_path(self):
++        from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
++
++        calls = []
++
++        class FakeAttnBackend:
++            def update_mamba_state_after_mtp_verify(self, **kwargs):
++                calls.append(kwargs)
++
++        worker = SimpleNamespace(
++            _need_mamba_verify_commit=True,
++            block_size=4,
++            server_args=SimpleNamespace(mamba_track_interval=16),
++            target_worker=SimpleNamespace(
++                model_runner=SimpleNamespace(
++                    req_to_token_pool=SimpleNamespace(mamba_pool=SimpleNamespace()),
++                    attn_backend=FakeAttnBackend(),
++                    model=object(),
++                )
++            ),
++        )
++        batch = SimpleNamespace(mamba_track_indices=None)
++        commit_lens = torch.tensor([1, 3], dtype=torch.int32)
++
++        DFlashWorkerV2._update_target_mamba_state_after_verify(
++            worker,
++            batch=batch,
++            seq_lens_pre_verify=torch.tensor([10, 20], dtype=torch.int64),
++            commit_lens=commit_lens,
++        )
++
++        self.assertEqual(len(calls), 1)
++        torch.testing.assert_close(
++            calls[0]["last_correct_step_indices"],
++            torch.tensor([0, 2], dtype=torch.int64),
++        )
++        self.assertIsNone(calls[0]["mamba_track_indices"])
++        self.assertIsNone(calls[0]["mamba_steps_to_track"])
++
++
+ class _FakeTpGroup:
+     """Single-process stand-in for the TP GroupCoordinator: replays the
+     concatenation of all ranks' recorded all-gather inputs."""
+-- 
+2.34.1
+

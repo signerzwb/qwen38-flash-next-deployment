@@ -1,0 +1,43 @@
+From 3dcd0cf83d4837976ea493d897394437227ca977 Mon Sep 17 00:00:00 2001
+From: root <root@MyComputer.localdomain>
+Date: Sat, 29 Aug 2026 23:50:08 +0800
+Subject: [PATCH 13/38] feat(metrics): PREFILL-REQ adds cache_salt and mamba
+ fork fields
+
+salt identifies the radix namespace (zero-hit re-prefill usually means
+a different salt/client); mamba_branch_seqlen + mamba_host_hit tell a
+broken GDN state chain (high KV hit, branch=0) apart from a genuinely
+divergent prefix root (0 KV hit).
+---
+ .../managers/scheduler_components/metrics_reporter.py | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/python/sglang/srt/managers/scheduler_components/metrics_reporter.py b/python/sglang/srt/managers/scheduler_components/metrics_reporter.py
+index 29209842c1..a78761c6b2 100644
+--- a/python/sglang/srt/managers/scheduler_components/metrics_reporter.py
++++ b/python/sglang/srt/managers/scheduler_components/metrics_reporter.py
+@@ -671,11 +671,20 @@ class SchedulerMetricsReporter:
+                         continue
+                     _hit_dev = len(_req.prefix_indices)
+                     _hit_host = _req.host_hit_length or 0
++                    # cache_salt namespace: different salt = radix trees never
++                    # shared, the #1 cause of zero-hit full re-prefill.
++                    # mamba_branch: longest position the KV tree could have hit
++                    # if a mamba state existed at the fork -- 0 with high KV
++                    # hit = GDN state chain broken; high with 0 KV hit = the
++                    # prefix root genuinely diverged (different client/salt).
+                     logger.info(
+-                        'PREFILL-REQ rid=%s input=%d chunk=%d+%d end=%d hit_device=%d hit_host=%d',
++                        'PREFILL-REQ rid=%s input=%d chunk=%d+%d end=%d hit_device=%d hit_host=%d salt=%s mamba_branch=%s mamba_host_hit=%d',
+                         _req.rid, _input, _req.extend_range.start,
+                         _req.extend_range.length, _req.extend_range.end,
+                         _hit_dev, _hit_host,
++                        _req.cache_salt,
++                        _req.mamba_branching_seqlen,
++                        _req.mamba_host_hit_length or 0,
+                     )
+         if self.current_scheduler_metrics_enabled:
+             self.metrics_collector.increment_prefill_cuda_graph_pass(
+-- 
+2.34.1
+

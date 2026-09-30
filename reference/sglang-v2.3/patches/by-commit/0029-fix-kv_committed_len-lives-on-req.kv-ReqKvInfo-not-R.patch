@@ -1,0 +1,26 @@
+From 26ac057043a1fd19310289a71ae036fca6ac799d Mon Sep 17 00:00:00 2001
+From: root <root@MyComputer.localdomain>
+Date: Mon, 31 Aug 2026 10:58:02 +0800
+Subject: [PATCH 29/38] fix: kv_committed_len lives on req.kv (ReqKvInfo), not
+ Req directly
+
+---
+ .../srt/managers/scheduler_components/batch_result_processor.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
+index 7d6810b02f..04c47cd7be 100644
+--- a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
++++ b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
+@@ -336,7 +336,7 @@ class SchedulerBatchResultProcessor:
+                         and req in batch.decoding_reqs
+                         and not batch.spec_algorithm.is_none()
+                     ):
+-                        req.kv_committed_len += 1
++                        req.kv.kv_committed_len += 1
+                     if req.finished():
+                         self._maybe_collect_routed_experts(req)
+                         self._maybe_collect_indexer_topk(req)
+-- 
+2.34.1
+

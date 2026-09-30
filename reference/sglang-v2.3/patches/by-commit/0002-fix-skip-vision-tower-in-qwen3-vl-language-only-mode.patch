@@ -1,0 +1,163 @@
+From 163676a7e3d283a7b648a3664bacbb9412901b87 Mon Sep 17 00:00:00 2001
+From: root <root@MyComputer.localdomain>
+Date: Wed, 19 Aug 2026 16:15:35 +0800
+Subject: [PATCH 02/38] fix: skip vision tower in qwen3 vl language-only mode
+
+---
+ python/sglang/srt/models/qwen3_vl.py          |   8 +-
+ .../models/test_qwen3_vl_language_only.py     | 117 ++++++++++++++++++
+ 2 files changed, 123 insertions(+), 2 deletions(-)
+ create mode 100644 test/registered/unit/models/test_qwen3_vl_language_only.py
+
+diff --git a/python/sglang/srt/models/qwen3_vl.py b/python/sglang/srt/models/qwen3_vl.py
+index 176bb40e4f..98a4c9707c 100644
+--- a/python/sglang/srt/models/qwen3_vl.py
++++ b/python/sglang/srt/models/qwen3_vl.py
+@@ -73,7 +73,7 @@ from sglang.srt.multimodal.mm_utils import (
+     run_dp_sharded_mrope_vision_model,
+ )
+ from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
+-from sglang.srt.runtime_context import get_exec, get_mm, get_parallel
++from sglang.srt.runtime_context import get_disagg, get_exec, get_mm, get_parallel
+ from sglang.srt.utils import (
+     add_prefix,
+     cpu_has_amx_support,
+@@ -1271,7 +1271,11 @@ class Qwen3VLForConditionalGeneration(nn.Module):
+         self.use_data_parallel = get_mm().mm_enable_dp_encoder
+ 
+         self.language_model_only = getattr(config, "language_model_only", False)
+-        if self.language_model_only:
++        self.language_only = getattr(config, "language_only", False)
++        keep_local_vision = (
++            self.language_only and get_disagg().enable_adaptive_dispatch_to_encoder
++        )
++        if self.language_model_only or (self.language_only and not keep_local_vision):
+             self.visual = None
+         else:
+             self.visual = Qwen3VLMoeVisionModel(
+diff --git a/test/registered/unit/models/test_qwen3_vl_language_only.py b/test/registered/unit/models/test_qwen3_vl_language_only.py
+new file mode 100644
+index 0000000000..aed0a92751
+--- /dev/null
++++ b/test/registered/unit/models/test_qwen3_vl_language_only.py
+@@ -0,0 +1,117 @@
++import unittest
++from types import SimpleNamespace
++from unittest import mock
++
++import torch.nn as nn
++
++from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
++from sglang.test.ci.ci_register import register_cpu_ci
++
++
++register_cpu_ci(est_time=1, suite="base-a-test-cpu")
++
++
++class _FakeVision:
++    def __init__(self, *args, **kwargs):
++        raise AssertionError("language-only serving must not build the vision tower")
++
++
++class _RecordingVision(nn.Module):
++    pass
++
++
++class _FakeLanguageModel(nn.Module):
++    def __init__(self, *args, **kwargs):
++        super().__init__()
++        self.embed_tokens = nn.Embedding(32, 8)
++
++
++class TestQwen3VLLanguageOnly(unittest.TestCase):
++    def test_language_only_skips_vision_tower_but_keeps_mm_routing(self):
++        text_config = SimpleNamespace(
++            rope_scaling={}, tie_word_embeddings=False, vocab_size=32, hidden_size=8
++        )
++        config = SimpleNamespace(
++            language_model_only=False,
++            language_only=True,
++            encoder_only=False,
++            vision_config=SimpleNamespace(deepstack_visual_indexes=[]),
++            text_config=text_config,
++            tie_word_embeddings=False,
++        )
++
++        fake_pp = SimpleNamespace(is_last_rank=True, world_size=1)
++        with mock.patch(
++            "sglang.srt.models.qwen3_vl.get_pp_group", return_value=fake_pp
++        ), mock.patch(
++            "sglang.srt.models.qwen3_vl.get_mm",
++            return_value=SimpleNamespace(mm_enable_dp_encoder=False),
++        ), mock.patch(
++            "sglang.srt.models.qwen3_vl.get_disagg",
++            return_value=SimpleNamespace(enable_adaptive_dispatch_to_encoder=False),
++            create=True,
++        ), mock.patch(
++            "sglang.srt.models.qwen3_vl.get_parallel",
++            return_value=SimpleNamespace(enable_dp_lm_head=False),
++        ), mock.patch(
++            "sglang.srt.models.qwen3_vl.Qwen3VLMoeVisionModel", _FakeVision
++        ), mock.patch(
++            "sglang.srt.models.qwen3_vl.ParallelLMHead", return_value=nn.Identity()
++        ), mock.patch(
++            "sglang.srt.models.qwen3_vl.LogitsProcessor", return_value=object()
++        ), mock.patch(
++            "sglang.srt.models.qwen3_vl.Pooler", return_value=object()
++        ):
++            model = Qwen3VLForConditionalGeneration(
++                config=config, language_model_cls=_FakeLanguageModel
++            )
++
++        self.assertIsNone(model.visual)
++        self.assertFalse(model.language_model_only)
++        self.assertTrue(model.language_only)
++
++    def test_adaptive_language_only_keeps_local_vision_fallback(self):
++        text_config = SimpleNamespace(
++            rope_scaling={}, tie_word_embeddings=False, vocab_size=32, hidden_size=8
++        )
++        config = SimpleNamespace(
++            language_model_only=False,
++            language_only=True,
++            encoder_only=False,
++            vision_config=SimpleNamespace(deepstack_visual_indexes=[]),
++            text_config=text_config,
++            tie_word_embeddings=False,
++        )
++
++        fake_pp = SimpleNamespace(is_last_rank=True, world_size=1)
++        with mock.patch(
++            "sglang.srt.models.qwen3_vl.get_pp_group", return_value=fake_pp
++        ), mock.patch(
++            "sglang.srt.models.qwen3_vl.get_mm",
++            return_value=SimpleNamespace(mm_enable_dp_encoder=False),
++        ), mock.patch(
++            "sglang.srt.models.qwen3_vl.get_disagg",
++            return_value=SimpleNamespace(enable_adaptive_dispatch_to_encoder=True),
++            create=True,
++        ), mock.patch(
++            "sglang.srt.models.qwen3_vl.get_parallel",
++            return_value=SimpleNamespace(enable_dp_lm_head=False),
++        ), mock.patch(
++            "sglang.srt.models.qwen3_vl.Qwen3VLMoeVisionModel",
++            return_value=_RecordingVision(),
++        ), mock.patch(
++            "sglang.srt.models.qwen3_vl.ParallelLMHead", return_value=nn.Identity()
++        ), mock.patch(
++            "sglang.srt.models.qwen3_vl.LogitsProcessor", return_value=object()
++        ), mock.patch(
++            "sglang.srt.models.qwen3_vl.Pooler", return_value=object()
++        ):
++            model = Qwen3VLForConditionalGeneration(
++                config=config, language_model_cls=_FakeLanguageModel
++            )
++
++        self.assertIsNotNone(model.visual)
++
++
++if __name__ == "__main__":
++    unittest.main()
+-- 
+2.34.1
+

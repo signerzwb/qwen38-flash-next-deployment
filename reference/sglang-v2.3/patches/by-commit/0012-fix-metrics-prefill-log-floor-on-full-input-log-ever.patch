@@ -1,0 +1,59 @@
+From 909c3bec0f57833b1d45816f42fbd298f7c4eb5e Mon Sep 17 00:00:00 2001
+From: root <root@MyComputer.localdomain>
+Date: Sat, 29 Aug 2026 22:11:19 +0800
+Subject: [PATCH 12/38] fix(metrics): prefill log floor on full input, log
+ every chunk
+
+Flooring per-chunk new tokens made a 6k chunked request fully silent
+(first chunk misjudged as middle, tail chunk under floor). Floor now
+compares len(origin_input_ids); each chunk logs one line showing the
+chunked-prefill progression.
+---
+ .../scheduler_components/metrics_reporter.py  | 21 ++++++++-----------
+ 1 file changed, 9 insertions(+), 12 deletions(-)
+
+diff --git a/python/sglang/srt/managers/scheduler_components/metrics_reporter.py b/python/sglang/srt/managers/scheduler_components/metrics_reporter.py
+index bb59ea8a33..29209842c1 100644
+--- a/python/sglang/srt/managers/scheduler_components/metrics_reporter.py
++++ b/python/sglang/srt/managers/scheduler_components/metrics_reporter.py
+@@ -657,28 +657,25 @@ class SchedulerMetricsReporter:
+             # with SGLANG_PREFILL_LOG_MIN_TOKENS (0 = log every request).
+             if batch is not None and batch.forward_mode.is_extend():
+                 import os as _os
++                # Floor on the FULL input length (not per-chunk tokens): a
++                # chunked 200k request logs every chunk even though each chunk
++                # is small, while hook-burst 64-token requests stay silent.
+                 _floor = _os.environ.get('SGLANG_PREFILL_LOG_MIN_TOKENS', '4096')
+                 try:
+                     _floor = int(_floor)
+                 except ValueError:
+                     _floor = 4096
+                 for _req in batch.reqs:
+-                    _new_tok = _req.extend_range.length if _req.extend_range else 0
+-                    # Chunked prefill: skip middle chunks (extend_range.end has
+-                    # not reached full input), log first + tail chunks. Middles
+-                    # are identified by extending beyond the origin input len.
+-                    _is_middle = (
+-                        _req.extend_range is not None
+-                        and _req.extend_range.end < len(_req.origin_input_ids)
+-                    )
+-                    if _is_middle or _new_tok < _floor:
++                    _input = len(_req.origin_input_ids)
++                    if _input < _floor or _req.extend_range is None:
+                         continue
+                     _hit_dev = len(_req.prefix_indices)
+                     _hit_host = _req.host_hit_length or 0
+                     logger.info(
+-                        'PREFILL-REQ rid=%s new=%d hit_device=%d hit_host=%d input=%d',
+-                        _req.rid, _new_tok, _hit_dev, _hit_host,
+-                        len(_req.origin_input_ids),
++                        'PREFILL-REQ rid=%s input=%d chunk=%d+%d end=%d hit_device=%d hit_host=%d',
++                        _req.rid, _input, _req.extend_range.start,
++                        _req.extend_range.length, _req.extend_range.end,
++                        _hit_dev, _hit_host,
+                     )
+         if self.current_scheduler_metrics_enabled:
+             self.metrics_collector.increment_prefill_cuda_graph_pass(
+-- 
+2.34.1
+

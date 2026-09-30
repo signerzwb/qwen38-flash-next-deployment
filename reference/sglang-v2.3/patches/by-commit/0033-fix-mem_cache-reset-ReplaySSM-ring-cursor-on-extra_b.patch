@@ -1,0 +1,39 @@
+From 37dfa1dd422f76e30ab17f26cf9dbab26eafcaa0 Mon Sep 17 00:00:00 2001
+From: root <root@MyComputer.localdomain>
+Date: Fri, 4 Sep 2026 01:15:00 +0800
+Subject: [PATCH 33/38] fix(mem_cache): reset ReplaySSM ring cursor on
+ extra_buffer donate path (#37837 hunk)
+
+donate_mamba_ping_pong_slot handed the tracked slot to the radix cache and
+swapped in a fresh slot without resetting replayssm_write_pos, while the
+no_buffer path (MambaPool.copy_from) resets both. This stack runs
+replayssm-spec + extra_buffer_lazy in production, so stale cursors on
+donated/replacement slots applied to us. Only the memory_pool hunk is
+taken; the PR's attention_hook hunk targets the standalone
+--enable-linear-replayssm flag which this stack does not use.
+---
+ python/sglang/srt/mem_cache/memory_pool.py | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/python/sglang/srt/mem_cache/memory_pool.py b/python/sglang/srt/mem_cache/memory_pool.py
+index 697554b132..645add8f1e 100644
+--- a/python/sglang/srt/mem_cache/memory_pool.py
++++ b/python/sglang/srt/mem_cache/memory_pool.py
+@@ -1531,6 +1531,14 @@ class HybridReqToTokenPool(ReqToTokenPool):
+                 f"next_track_idx={req.mamba_next_track_idx}, "
+                 f"rid={req.rid}"
+             )
++        # PR#37837: the donated checkpoint goes to the radix cache and the
++        # replacement slot starts a fresh tracking window — neither carries
++        # pending ReplaySSM ring entries. copy_from resets both cursors on
++        # the no_buffer path; without the same reset here both go stale.
++        _wp = getattr(self.mamba_pool, "replayssm_write_pos", None)
++        if _wp is not None:
++            _wp[mamba_value_donated] = 0
++            _wp[new_slot] = 0
+         self.set_mamba_ping_pong_slot(req, donate_idx, new_slot[0])
+         return mamba_value_donated
+ 
+-- 
+2.34.1
+
